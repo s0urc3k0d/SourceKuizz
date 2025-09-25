@@ -39,7 +39,7 @@ export interface SessionStats {
 }
 
 export class QuizService {
-  private databaseService: DatabaseService;
+  public databaseService: DatabaseService;
 
   constructor(databaseService: DatabaseService) {
     this.databaseService = databaseService;
