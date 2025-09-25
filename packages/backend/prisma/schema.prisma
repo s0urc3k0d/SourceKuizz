@@ -1,0 +1,116 @@
+// Prisma schema – SQLite (dev)
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String        @id @default(cuid())
+  username     String        @unique
+  passwordHash String?
+  twitchId     String?       @unique
+  avatarUrl    String?
+  createdAt    DateTime      @default(now())
+  quizzes      Quiz[]
+  sessions     AuthSession[]
+  gamePlayers  GamePlayer[]
+}
+
+model AuthSession {
+  id               String   @id @default(cuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id])
+  refreshTokenHash String
+  createdAt        DateTime @default(now())
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  userAgent        String?
+  ip               String?
+  @@index([userId])
+}
+
+model Quiz {
+  id          String     @id @default(cuid())
+  title       String
+  description String?
+  ownerId     String
+  owner       User       @relation(fields: [ownerId], references: [id])
+  questions   Question[]
+  gameSessions GameSession[]
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+model Question {
+  id          String           @id @default(cuid())
+  quizId      String
+  quiz        Quiz             @relation(fields: [quizId], references: [id])
+  type        String
+  prompt      String
+  mediaUrl    String?
+  timeLimitMs Int
+  order       Int
+  options     QuestionOption[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  answers     PlayerAnswer[]
+  @@index([quizId])
+}
+
+model QuestionOption {
+  id         String    @id @default(cuid())
+  questionId String
+  question   Question  @relation(fields: [questionId], references: [id])
+  label      String
+  isCorrect  Boolean   @default(false)
+  weight     Int       @default(1)
+  answers    PlayerAnswer[]
+  @@index([questionId])
+}
+
+model GameSession {
+  id         String       @id @default(cuid())
+  quizId     String
+  quiz       Quiz         @relation(fields: [quizId], references: [id])
+  code       String       @unique
+  status     String       @default("lobby")
+  players    GamePlayer[]
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  @@index([quizId])
+}
+
+model GamePlayer {
+  id         String        @id @default(cuid())
+  sessionId  String
+  session    GameSession   @relation(fields: [sessionId], references: [id])
+  userId     String?
+  user       User?         @relation(fields: [userId], references: [id])
+  nickname   String
+  score      Int           @default(0)
+  answers    PlayerAnswer[]
+  createdAt  DateTime      @default(now())
+  @@index([sessionId])
+  @@index([userId])
+  uniqueKey  String        @unique // sessionId:nickname
+}
+
+model PlayerAnswer {
+  id            String          @id @default(cuid())
+  playerId      String
+  player        GamePlayer      @relation(fields: [playerId], references: [id])
+  questionId    String
+  question      Question        @relation(fields: [questionId], references: [id])
+  optionId      String?
+  option        QuestionOption? @relation(fields: [optionId], references: [id])
+  correct       Boolean
+  timeMs        Int
+  createdAt     DateTime        @default(now())
+  uniqueKey     String          @unique // playerId:questionId
+  @@index([questionId])
+  @@index([optionId])
+}
