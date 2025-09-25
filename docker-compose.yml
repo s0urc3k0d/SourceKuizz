@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  sourcekuizz:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=/app/data/sourcekuizz.db
+      - JWT_SECRET=${JWT_SECRET:-your-super-secret-jwt-key-change-this-in-production}
+      - TWITCH_CLIENT_ID=${TWITCH_CLIENT_ID}
+      - TWITCH_CLIENT_SECRET=${TWITCH_CLIENT_SECRET}
+      - TWITCH_CALLBACK_URL=${TWITCH_CALLBACK_URL:-http://localhost:3000/auth/twitch/callback}
+      - CORS_ORIGIN=${CORS_ORIGIN:-http://localhost:3000}
+    volumes:
+      - sourcekuizz_data:/app/data
+      - sourcekuizz_logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) })"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Redis pour la mise à l'échelle (optionnel)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    profiles:
+      - scaling
+
+  # PostgreSQL pour la production (optionnel)
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=sourcekuizz
+      - POSTGRES_USER=sourcekuizz
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-sourcekuizz_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    profiles:
+      - production
+
+  # Nginx reverse proxy (optionnel)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - sourcekuizz
+    restart: unless-stopped
+    profiles:
+      - production
+
+volumes:
+  sourcekuizz_data:
+    driver: local
+  sourcekuizz_logs:
+    driver: local
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+
+networks:
+  default:
+    name: sourcekuizz_network
