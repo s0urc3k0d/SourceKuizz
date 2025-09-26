@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
     "test": "vitest run",
     "test:e2e": "jest --testMatch '**/test/e2e/**/*.jest-spec.ts'",
     "test:ci": "pnpm run test && pnpm run test:e2e",

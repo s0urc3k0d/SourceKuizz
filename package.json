@@ -6,6 +6,13 @@
   "scripts": {
     "build": "pnpm -r run build",
     "dev": "pnpm -r run dev",
+    "dev:backend": "pnpm --filter @sourcekuizz/backend run dev",
+    "dev:web": "pnpm --filter @sourcekuizz/web run dev",
+    "dev:shared": "pnpm --filter @sourcekuizz/shared run dev",
+    "dev:stack": "concurrently -k -n shared,backend,web -c yellow,blue,green \"pnpm -w run dev:shared\" \"pnpm -w run dev:backend\" \"pnpm -w run dev:web\"",
+    "start:backend": "pnpm --filter @sourcekuizz/backend run start",
+    "start:web": "pnpm --filter @sourcekuizz/web run start",
+    "start:stack": "concurrently -n backend,web \"pnpm -w run start:backend\" \"pnpm -w run start:web\"",
     "lint": "eslint . --ext .ts,.tsx || true",
     "test": "pnpm -r run test"
   },

@@ -7,11 +7,12 @@
     "emitDecoratorMetadata": true,
     "strict": true,
     "sourceMap": true,
+    "rootDir": "src",
     "outDir": "dist",
     "baseUrl": "./",
     "esModuleInterop": true,
     "skipLibCheck": true
   },
-  "include": ["src", "test", "vitest.setup.ts"],
-  "exclude": ["dist", "node_modules"]
+  "include": ["src"],
+  "exclude": ["dist", "node_modules", "test", "vitest.setup.ts", "scripts"]
 }

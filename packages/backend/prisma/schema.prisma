@@ -78,6 +78,7 @@ model GameSession {
   quiz       Quiz         @relation(fields: [quizId], references: [id])
   code       String       @unique
   status     String       @default("lobby")
+  allowSpectatorReactions Boolean @default(true)
   players    GamePlayer[]
   createdAt  DateTime     @default(now())
   updatedAt  DateTime     @updatedAt

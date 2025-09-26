@@ -26,7 +26,8 @@ interface SessionQuestion {
 interface SessionState {
   id: string;
   players: Map<string, SessionPlayer>;
-  detached?: Map<string, Omit<SessionPlayer,'id'>>; // userId -> snapshot joueur pour reconnexion
+  detached?: Map<string, { nickname: string; score: number; streak: number; userId: string; expiresAt: number }>; // userId -> snapshot TTL
+  viewers?: Set<string>; // sockets spectateurs
   questionIndex: number;
   questions: SessionQuestion[];
   answers: Map<string, Set<string>>; // questionId -> set(userSocketIds) pour double réponses
@@ -35,6 +36,7 @@ interface SessionState {
   timer?: NodeJS.Timeout;
   hostId?: string; // socket.id du host
   autoNext?: boolean; // démarrage automatique des questions suivantes
+  allowSpectatorReactions?: boolean; // spectateurs peuvent envoyer des réactions
   createdAt: number; // pour métrique durée session
 }
 
@@ -58,6 +60,14 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   private questionDurationBuckets = [0.25,0.5,0.75,1,1.5,2,3,5,10];
   private sessionDurationBuckets = [1,2,5,10,20,30,60,120,300];
   private getRevealDelayMs() { return parseInt(process.env.REVEAL_DELAY_MS || '2000', 10); }
+  private getDetachedTtlMs() { return parseInt(process.env.DETACHED_TTL_MS || '600000', 10); }
+
+  private emitReject(socket: Socket, event: string, code: string, message?: string, details?: any) {
+    const payload: any = { code };
+    if (message) payload.message = message;
+    if (details) payload.details = details;
+    socket.emit(event, payload);
+  }
 
   constructor(
     private scoring: ScoringService,
@@ -83,12 +93,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   handleDisconnect(socket: Socket) {
     // Retirer joueur des sessions
     for (const [code, s] of this.sessions.entries()) {
+      if (s.viewers && s.viewers.has(socket.id)) {
+        s.viewers.delete(socket.id);
+        this.metrics.dec('viewers.active');
+      }
       const existing = s.players.get(socket.id);
       if (existing && s.players.delete(socket.id)) {
         this.metrics.inc('player.disconnect');
         this.metrics.dec('players.active');
         if (existing.userId && s.detached) {
-          s.detached.set(existing.userId, { nickname: existing.nickname, score: existing.score, streak: existing.streak, userId: existing.userId });
+          // cleanup préalable
+          this.cleanupDetached(s);
+          s.detached.set(existing.userId, { nickname: existing.nickname, score: existing.score, streak: existing.streak, userId: existing.userId, expiresAt: this.clock.now() + this.getDetachedTtlMs() });
         }
         let hostChanged = false;
         if (s.hostId === socket.id) {
@@ -111,7 +127,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
           for (const pid of s.players.keys()) {
             const sock = this.server.sockets.sockets.get(pid);
             if (sock) {
-              sock.emit('session_state', { status: s.phase || 'lobby', questionIndex: s.questionIndex, remainingMs: 0, totalQuestions: s.questions.length, isHost: s.hostId === pid });
+              sock.emit('session_state', { status: s.phase || 'lobby', questionIndex: s.questionIndex, remainingMs: 0, totalQuestions: s.questions.length, isHost: s.hostId === pid, hostId: s.hostId, players: this.buildPlayersList(s), spectators: this.buildSpectatorsList(s), allowSpectatorReactions: !!s.allowSpectatorReactions });
             }
           }
         }
@@ -121,7 +137,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
 
   /** Join session (creates ephemeral session with quiz questions loaded) */
   @SubscribeMessage('join_session')
-  async handleJoin(@MessageBody() data: { code?: string; quizId: string; nickname?: string }, @ConnectedSocket() socket: Socket) {
+  async handleJoin(@MessageBody() data: { code?: string; quizId: string; nickname?: string; spectator?: boolean }, @ConnectedSocket() socket: Socket) {
     let { code, quizId } = data;
     if (!code) {
       // Générer code session alphanum 6 chars non collision
@@ -140,16 +156,26 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         include: { options: { select: { id: true, isCorrect: true } } },
       });
       // Créer ou récupérer la session DB de façon race-safe
-  await this.createOrGetSession(code!, quizId);
-  this.sessions.set(code!, {
+      await this.createOrGetSession(code!, quizId);
+      // Lire le flag persistant si disponible
+      let allowSpectator = true;
+      try {
+        const db = await this.prisma.gameSession.findUnique({ where: { code: code! } });
+        if (db && typeof (db as any).allowSpectatorReactions === 'boolean') {
+          allowSpectator = (db as any).allowSpectatorReactions as boolean;
+        }
+      } catch {}
+      this.sessions.set(code!, {
         id: code,
         players: new Map(),
     detached: new Map(),
+        viewers: new Set(),
         questionIndex: 0,
         questions: questions.map(q => ({ id: q.id, timeLimitMs: q.timeLimitMs, options: q.options })),
         answers: new Map(),
         phase: 'lobby',
         autoNext: false,
+        allowSpectatorReactions: allowSpectator,
         createdAt: this.clock.now(),
       });
       this.metrics.inc('sessions.active');
@@ -159,40 +185,63 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     // Protection: empêcher un client de ré-utiliser le même code avec un autre quiz
     const existingDb = await this.prisma.gameSession.findUnique({ where: { code } });
     if (existingDb && existingDb.quizId !== quizId) {
-      socket.emit('join_rejected', { code: 'quiz_mismatch' });
+      this.emitReject(socket, 'join_rejected', 'quiz_mismatch');
       return;
     }
-    const nickname = data.nickname || 'Player-' + socket.id.slice(0, 4);
+  const nickname = data.nickname || 'Player-' + socket.id.slice(0, 4);
+  (socket.data as any).nickname = nickname;
+    const isSpectator = !!data.spectator;
+    if (isSpectator) {
+      state.viewers?.add(socket.id);
+      this.metrics.inc('viewers.active');
+  socket.join(code!);
+  (socket.data as any).nickname = data.nickname || (socket.data as any).nickname || 'Spectator-' + socket.id.slice(0,4);
+      let remainingMs = 0;
+      if (state.phase === 'question' && state.activeQuestionStartedAt) {
+        const qNow = this.clock.now();
+        const activeQ = state.questions[state.questionIndex];
+        const elapsed = qNow - state.activeQuestionStartedAt;
+        remainingMs = Math.max(0, (activeQ.timeLimitMs || 0) - elapsed);
+      }
+  socket.emit('session_state', { code, status: state.phase || 'lobby', questionIndex: state.questionIndex, remainingMs, totalQuestions: state.questions.length, isHost: false, isSpectator: true, autoNext: state.autoNext, hostId: state.hostId, players: this.buildPlayersList(state), spectators: this.buildSpectatorsList(state), allowSpectatorReactions: !!state.allowSpectatorReactions });
+      this.broadcastLeaderboard(code);
+      return;
+    }
   const userId = (socket.data as any).userId as string | undefined;
   const player: SessionPlayer = { id: socket.id, nickname, score: 0, streak: 0, userId };
 
-  // Reconnexion: rechercher joueur existant par userId stable
+  // Reconnexion: uniquement si userId détaché ou ancien socket inactif
   let reconnectedFromId: string | undefined;
   if (userId) {
+    this.cleanupDetached(state);
+    // Cas 1: joueur détaché connu
+    if (state.detached?.has(userId)) {
+      const snapshot = state.detached.get(userId)!;
+      player.score = snapshot.score;
+      player.streak = snapshot.streak;
+      player.nickname = snapshot.nickname;
+      state.detached.delete(userId);
+      reconnectedFromId = 'detached';
+    } else {
+      // Cas 2: ancien socket encore dans players mais plus connecté -> reconnexion
       for (const [sid, existing] of state.players.entries()) {
         if (existing.userId && existing.userId === userId) {
-          reconnectedFromId = sid;
-          // Conserver score/streak/nickname
-          player.score = existing.score;
-          player.streak = existing.streak;
-          player.nickname = existing.nickname;
-          state.players.delete(sid);
-          // Migrer réponses pour empêcher double answer
-          for (const set of state.answers.values()) {
-            if (set.has(sid)) { set.delete(sid); set.add(socket.id); }
+          const stillConnected = this.server.sockets.sockets.has(sid);
+          if (!stillConnected) {
+            reconnectedFromId = sid;
+            player.score = existing.score;
+            player.streak = existing.streak;
+            player.nickname = existing.nickname;
+            state.players.delete(sid);
+            for (const set of state.answers.values()) {
+              if (set.has(sid)) { set.delete(sid); set.add(socket.id); }
+            }
           }
           break;
         }
       }
-      if (!reconnectedFromId && state.detached?.has(userId)) {
-        const snapshot = state.detached.get(userId)!;
-        player.score = snapshot.score;
-        player.streak = snapshot.streak;
-        player.nickname = snapshot.nickname;
-        state.detached.delete(userId);
-        reconnectedFromId = 'detached';
-      }
     }
+  }
     state.players.set(socket.id, player);
     if (reconnectedFromId) {
       if (state.hostId === reconnectedFromId) state.hostId = socket.id; // transférer host automatiquement
@@ -223,7 +272,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     const elapsed = qNow - state.activeQuestionStartedAt;
     remainingMs = Math.max(0, (activeQ.timeLimitMs || 0) - elapsed);
   }
-  socket.emit('session_state', { code, status: state.phase || 'lobby', questionIndex: state.questionIndex, remainingMs, totalQuestions: state.questions.length, isHost: state.hostId === socket.id, autoNext: state.autoNext, reconnected: !!reconnectedFromId });
+  socket.emit('session_state', { code, status: state.phase || 'lobby', questionIndex: state.questionIndex, remainingMs, totalQuestions: state.questions.length, isHost: state.hostId === socket.id, isSpectator: false, autoNext: state.autoNext, reconnected: !!reconnectedFromId, hostId: state.hostId, players: this.buildPlayersList(state), spectators: this.buildSpectatorsList(state), allowSpectatorReactions: !!state.allowSpectatorReactions });
     if (reconnectedFromId) {
       // Forcer envoi leaderboard tout de suite pour refléter score restauré côté nouveau socket
       const entries = this.buildLeaderboardEntries(state);
@@ -242,7 +291,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
             const elapsed2 = qNow2 - state.activeQuestionStartedAt;
             rMs = Math.max(0, (activeQ2.timeLimitMs || 0) - elapsed2);
           }
-          other.emit('session_state', { code, status: state.phase || 'lobby', questionIndex: state.questionIndex, remainingMs: rMs, totalQuestions: state.questions.length, isHost: state.hostId === pid, autoNext: state.autoNext });
+          other.emit('session_state', { code, status: state.phase || 'lobby', questionIndex: state.questionIndex, remainingMs: rMs, totalQuestions: state.questions.length, isHost: state.hostId === pid, autoNext: state.autoNext, hostId: state.hostId, players: this.buildPlayersList(state), spectators: this.buildSpectatorsList(state), allowSpectatorReactions: !!state.allowSpectatorReactions });
         }
       }
     }
@@ -253,16 +302,16 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   @SubscribeMessage('start_question')
   handleStartQuestion(@MessageBody() data: { code: string }, @ConnectedSocket() socket: Socket) {
     const code = data.code || this.findSessionForSocket(socket.id);
-    if (!code) return;
+    if (!code) { this.emitReject(socket, 'start_question_rejected', 'unknown_session'); return; }
     const session = this.sessions.get(code);
-    if (!session) return;
+    if (!session) { this.emitReject(socket, 'start_question_rejected', 'unknown_session'); return; }
     if (session.hostId && session.hostId !== socket.id) {
-      socket.emit('start_question_rejected', { code: 'not_host' });
+      this.emitReject(socket, 'start_question_rejected', 'not_host');
       return;
     }
-    if (session.phase !== 'lobby' && session.phase !== 'reveal') return; // only from lobby or after reveal
+    if (session.phase !== 'lobby' && session.phase !== 'reveal') { this.emitReject(socket, 'start_question_rejected', 'invalid_phase'); return; } // only from lobby or after reveal
     const q = session.questions[session.questionIndex];
-    if (!q) return;
+    if (!q) { this.emitReject(socket, 'start_question_rejected', 'unknown_question'); return; }
     this.startQuestionInternal(code, session);
   }
 
@@ -284,6 +333,27 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   session.timer = this.clock.setTimeout(() => this.advanceOrFinish(code), this.getRevealDelayMs()); // configurable reveal delay
   }
 
+  @SubscribeMessage('force_reveal')
+  handleForceReveal(@MessageBody() data: { code: string }, @ConnectedSocket() socket: Socket) {
+    const { code } = data;
+    const session = this.sessions.get(code);
+    if (!session) { this.emitReject(socket, 'force_reveal_rejected', 'unknown_session'); return; }
+    if (session.hostId !== socket.id) { this.emitReject(socket, 'force_reveal_rejected', 'not_host'); return; }
+    if (session.phase !== 'question') { this.emitReject(socket, 'force_reveal_rejected', 'invalid_phase'); return; }
+    this.forceReveal(code);
+  }
+
+  @SubscribeMessage('advance_next')
+  handleAdvanceNext(@MessageBody() data: { code: string }, @ConnectedSocket() socket: Socket) {
+    const { code } = data;
+    const session = this.sessions.get(code);
+    if (!session) { this.emitReject(socket, 'advance_next_rejected', 'unknown_session'); return; }
+    if (session.hostId !== socket.id) { this.emitReject(socket, 'advance_next_rejected', 'not_host'); return; }
+    // Autorisé depuis reveal ou lobby (pour passer à la suivante ou finir)
+    if (session.phase !== 'reveal' && session.phase !== 'lobby') { this.emitReject(socket, 'advance_next_rejected', 'invalid_phase'); return; }
+    this.advanceOrFinish(code);
+  }
+
   private advanceOrFinish(code: string) {
     const session = this.sessions.get(code);
     if (!session) return;
@@ -296,13 +366,15 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         const sessionDur = this.clock.now() - session.createdAt;
         this.metrics.observe('session.duration_seconds', sessionDur/1000, this.sessionDurationBuckets);
       }
+      // Clear detached à la fin
+      if (session.detached) session.detached.clear();
       this.server.to(code).emit('session_finished', { final: this.buildLeaderboardEntries(session) });
       return;
     }
     session.questionIndex += 1;
     session.activeQuestionStartedAt = undefined;
     session.phase = 'lobby';
-    this.server.to(code).emit('session_state', { status: 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, autoNext: session.autoNext });
+  this.server.to(code).emit('session_state', { status: 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, autoNext: session.autoNext, hostId: session.hostId, players: this.buildPlayersList(session), spectators: this.buildSpectatorsList(session), allowSpectatorReactions: !!session.allowSpectatorReactions });
     if (session.autoNext) {
       session.timer = this.clock.setTimeout(() => {
         if (session.phase === 'lobby') {
@@ -329,12 +401,15 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     @MessageBody() data: { questionId: string; optionId: string; clientTs: number; code?: string },
     @ConnectedSocket() socket: Socket,
   ) {
-    const code = data.code || this.findSessionForSocket(socket.id);
-    if (!code) return;
-    const session = this.sessions.get(code);
-    if (!session) return;
+  const code = data.code || this.findSessionForSocket(socket.id);
+  if (!code) { socket.emit('answer_ack', { questionId: data.questionId, accepted: false, reason: 'unknown_session' }); return; }
+  const session = this.sessions.get(code);
+  if (!session) { socket.emit('answer_ack', { questionId: data.questionId, accepted: false, reason: 'unknown_session' }); return; }
     const player = session.players.get(socket.id);
-    if (!player) return;
+    if (!player) {
+      socket.emit('answer_ack', { questionId: data.questionId, accepted: false, reason: 'spectator' });
+      return;
+    }
     if (!this.limiter.allow(socket.id + ':answer', this.answerRule)) {
       socket.emit('answer_ack', { questionId: data.questionId, accepted: false, reason: 'rate_limited' });
       return;
@@ -380,7 +455,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       const now2 = this.clock.now();
       rem = Math.max(0, (currentQuestion.timeLimitMs || 0) - (now2 - session.activeQuestionStartedAt));
     }
-    socket.emit('session_state', { status: session.phase || 'lobby', questionIndex: session.questionIndex, remainingMs: rem, totalQuestions: session.questions.length, isHost: session.hostId === socket.id, autoNext: session.autoNext });
+  socket.emit('session_state', { status: session.phase || 'lobby', questionIndex: session.questionIndex, remainingMs: rem, totalQuestions: session.questions.length, isHost: session.hostId === socket.id, autoNext: session.autoNext, hostId: session.hostId, players: this.buildPlayersList(session), spectators: this.buildSpectatorsList(session), allowSpectatorReactions: !!session.allowSpectatorReactions });
     // Persister réponse
     try {
       const sessionDb = await this.prisma.gameSession.findUnique({ where: { code } });
@@ -412,26 +487,50 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   @SubscribeMessage('reaction')
   handleReaction(@MessageBody() data: { emoji: string; code?: string }, @ConnectedSocket() socket: Socket) {
     const code = data.code || this.findSessionForSocket(socket.id);
-    if (!code) return;
+    if (!code) { this.emitReject(socket, 'reaction_rejected', 'unknown_session'); return; }
+    // Si spectator et non autorisé
+    const s = this.sessions.get(code);
+    if (s && s.viewers?.has(socket.id) && !s.allowSpectatorReactions) {
+      this.emitReject(socket, 'reaction_rejected', 'spectator_disabled');
+      return;
+    }
     if (!this.limiter.allow(socket.id + ':reaction', this.reactionRule)) {
-      socket.emit('reaction_rejected', { code: 'rate_limited' });
+      this.emitReject(socket, 'reaction_rejected', 'rate_limited');
       return;
     }
     this.server.to(code).emit('reaction_broadcast', { playerId: socket.id, emoji: data.emoji });
     this.metrics.inc('reaction.broadcast');
   }
 
+  @SubscribeMessage('toggle_spectator_reactions')
+  handleToggleSpectatorReactions(@MessageBody() data: { code: string; enabled: boolean }, @ConnectedSocket() socket: Socket) {
+    const { code, enabled } = data;
+    const session = this.sessions.get(code);
+    if (!session) { this.emitReject(socket, 'toggle_spectator_reactions_rejected', 'unknown_session'); return; }
+    if (session.hostId !== socket.id) { this.emitReject(socket, 'toggle_spectator_reactions_rejected', 'not_host'); return; }
+  session.allowSpectatorReactions = !!enabled;
+  // Persistance best-effort
+  (this.prisma.gameSession as any).update({ where: { code }, data: { allowSpectatorReactions: session.allowSpectatorReactions } }).catch(()=>{});
+    this.server.to(code).emit('spectator_reactions_toggled', { enabled: session.allowSpectatorReactions });
+    for (const pid of session.players.keys()) {
+      const sock = this.server.sockets.sockets.get(pid);
+      if (sock) {
+        sock.emit('session_state', { status: session.phase || 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, isHost: session.hostId === pid, autoNext: session.autoNext, hostId: session.hostId, players: this.buildPlayersList(session), spectators: this.buildSpectatorsList(session), allowSpectatorReactions: !!session.allowSpectatorReactions });
+      }
+    }
+  }
+
   @SubscribeMessage('transfer_host')
   handleTransferHost(@MessageBody() data: { code: string; targetPlayerId: string }, @ConnectedSocket() socket: Socket) {
     const { code, targetPlayerId } = data;
     const session = this.sessions.get(code);
-    if (!session) return;
+    if (!session) { this.emitReject(socket, 'transfer_host_rejected', 'unknown_session'); return; }
     if (session.hostId !== socket.id) {
-      socket.emit('transfer_host_rejected', { code: 'not_host' });
+      this.emitReject(socket, 'transfer_host_rejected', 'not_host');
       return;
     }
     if (!session.players.has(targetPlayerId)) {
-      socket.emit('transfer_host_rejected', { code: 'unknown_target' });
+      this.emitReject(socket, 'transfer_host_rejected', 'unknown_target');
       return;
     }
     session.hostId = targetPlayerId;
@@ -440,7 +539,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     for (const pid of session.players.keys()) {
       const sock = this.server.sockets.sockets.get(pid);
       if (sock) {
-        sock.emit('session_state', { status: session.phase || 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, isHost: session.hostId === pid, autoNext: session.autoNext });
+  sock.emit('session_state', { status: session.phase || 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, isHost: session.hostId === pid, autoNext: session.autoNext, hostId: session.hostId, players: this.buildPlayersList(session), spectators: this.buildSpectatorsList(session), allowSpectatorReactions: !!session.allowSpectatorReactions });
       }
     }
   }
@@ -449,9 +548,9 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   handleToggleAutoNext(@MessageBody() data: { code: string; enabled: boolean }, @ConnectedSocket() socket: Socket) {
     const { code, enabled } = data;
     const session = this.sessions.get(code);
-    if (!session) return;
+    if (!session) { this.emitReject(socket, 'toggle_auto_next_rejected', 'unknown_session'); return; }
     if (session.hostId !== socket.id) {
-      socket.emit('toggle_auto_next_rejected', { code: 'not_host' });
+      this.emitReject(socket, 'toggle_auto_next_rejected', 'not_host');
       return;
     }
     session.autoNext = !!enabled;
@@ -459,7 +558,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     for (const pid of session.players.keys()) {
       const sock = this.server.sockets.sockets.get(pid);
       if (sock) {
-        sock.emit('session_state', { status: session.phase || 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, isHost: session.hostId === pid, autoNext: session.autoNext });
+  sock.emit('session_state', { status: session.phase || 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, isHost: session.hostId === pid, autoNext: session.autoNext, hostId: session.hostId, players: this.buildPlayersList(session), spectators: this.buildSpectatorsList(session), allowSpectatorReactions: !!session.allowSpectatorReactions });
       }
     }
   }
@@ -475,6 +574,21 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     return Array.from(session.players.values())
       .sort((a, b) => b.score - a.score)
       .map((p, idx) => ({ playerId: p.id, nickname: p.nickname, score: p.score, rank: idx + 1 }));
+  }
+
+  private buildPlayersList(session: SessionState) {
+    return Array.from(session.players.entries()).map(([id, p]) => ({ id, nickname: p.nickname }));
+  }
+
+  private buildSpectatorsList(session: SessionState) {
+    if (!session.viewers || session.viewers.size === 0) return [] as { id: string; nickname: string }[];
+    const out: { id: string; nickname: string }[] = [];
+    for (const vid of session.viewers.values()) {
+      const sock = this.server.sockets.sockets.get(vid);
+      const nn = (sock?.data as any)?.nickname || 'Spectator-' + vid.slice(0,4);
+      out.push({ id: vid, nickname: nn });
+    }
+    return out;
   }
 
   private clearTimer(session: SessionState) {
@@ -508,10 +622,74 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
+  // Exposés à d'autres couches (HTTP) pour initialiser une session et lire son état
+  public async ensureSession(code: string | undefined, quizId: string): Promise<{ code: string; created: boolean }>
+  {
+    let c = code || randomCode();
+    if (!this.sessions.has(c)) {
+      // si collision code généré, on régénère
+      while (this.sessions.has(c) || await this.prisma.gameSession.findUnique({ where: { code: c } })) {
+        c = randomCode();
+      }
+      // Charger questions minimalistes
+      const questions = await this.prisma.question.findMany({ where: { quizId }, orderBy: { order: 'asc' }, include: { options: { select: { id: true, isCorrect: true } } } });
+      await this.createOrGetSession(c, quizId);
+      // Lire flag persistant
+      let allowSpectator = true;
+      try {
+        const db = await this.prisma.gameSession.findUnique({ where: { code: c } });
+        if (db && typeof (db as any).allowSpectatorReactions === 'boolean') {
+          allowSpectator = (db as any).allowSpectatorReactions as boolean;
+        }
+      } catch {}
+      this.sessions.set(c, {
+        id: c,
+        players: new Map(),
+        detached: new Map(),
+        questionIndex: 0,
+        questions: questions.map(q => ({ id: q.id, timeLimitMs: q.timeLimitMs, options: q.options })),
+        answers: new Map(),
+        phase: 'lobby',
+        autoNext: false,
+        allowSpectatorReactions: allowSpectator,
+        createdAt: this.clock.now(),
+      });
+      this.metrics.inc('sessions.active');
+      this.metrics.inc('session.create');
+      return { code: c, created: true };
+    }
+    return { code: c, created: false };
+  }
+
+  public getPublicState(code: string) {
+    const s = this.sessions.get(code);
+    if (!s) return undefined;
+    const remainingMs = s.phase === 'question' && s.activeQuestionStartedAt
+      ? Math.max(0, (s.questions[s.questionIndex]?.timeLimitMs || 0) - (this.clock.now() - s.activeQuestionStartedAt))
+      : 0;
+    return {
+      code,
+      status: s.phase || 'lobby',
+      questionIndex: s.questionIndex,
+      totalQuestions: s.questions.length,
+      playersCount: s.players.size,
+      autoNext: !!s.autoNext,
+      remainingMs,
+    };
+  }
+
+  // Donne l'identifiant de la question courante dans une session (ou undefined)
+  public getCurrentQuestionId(code: string): string | undefined {
+    const s = this.sessions.get(code);
+    if (!s) return undefined;
+    return s.questions[s.questionIndex]?.id;
+  }
+
   /** Libère toutes les sessions et timers (utilisé pour tests / shutdown) */
   public dispose() {
     for (const session of this.sessions.values()) {
       this.clearTimer(session);
+      if (session.detached) session.detached.clear();
     }
     this.sessions.clear();
     this.limiter.clear();
@@ -520,5 +698,13 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   // Support hook Nest (si jamais enregistré via OnModuleDestroy dans le futur)
   async onModuleDestroy() {
     this.dispose();
+  }
+
+  private cleanupDetached(s: SessionState) {
+    if (!s.detached || s.detached.size === 0) return;
+    const now = this.clock.now();
+    for (const [uid, snap] of [...s.detached.entries()]) {
+      if (snap.expiresAt <= now) s.detached.delete(uid);
+    }
   }
 }

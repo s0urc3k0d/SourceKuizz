@@ -1,6 +1,6 @@
 import { Injectable, ForbiddenException, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service';
-import { CreateQuestionInput, UpdateQuestionInput } from './question.dto';
+import { CreateQuestionInput, UpdateQuestionInput, ReorderQuestionsInput } from './question.dto';
 
 @Injectable()
 export class QuestionService {
@@ -73,5 +73,35 @@ export class QuestionService {
     if (!existing || existing.quizId !== quizId) throw new NotFoundException('question_not_found');
     await this.prisma.question.delete({ where: { id: questionId } });
     return { deleted: true };
+  }
+
+  async reorder(quizId: string, ownerId: string, data: ReorderQuestionsInput) {
+    await this.assertQuizOwnership(quizId, ownerId);
+    const questions = await this.prisma.question.findMany({ where: { quizId }, select: { id: true } });
+    const idsSet = new Set(questions.map(q => q.id));
+    if (data.orderedIds.some(id => !idsSet.has(id))) throw new BadRequestException('invalid_question_id_in_order');
+    return this.prisma.$transaction(
+      data.orderedIds.map((id, idx) => this.prisma.question.update({ where: { id }, data: { order: idx } }))
+    );
+  }
+
+  async duplicate(quizId: string, questionId: string, ownerId: string) {
+    await this.assertQuizOwnership(quizId, ownerId);
+    const existing = await this.prisma.question.findUnique({ where: { id: questionId }, include: { options: true } });
+    if (!existing || existing.quizId !== quizId) throw new NotFoundException('question_not_found');
+    const count = await this.prisma.question.count({ where: { quizId } });
+    const created = await this.prisma.question.create({
+      data: {
+        quizId,
+        type: existing.type,
+        prompt: existing.prompt + ' (copie)',
+        mediaUrl: existing.mediaUrl ?? undefined,
+        timeLimitMs: existing.timeLimitMs,
+        order: count,
+        options: { create: existing.options.map(o => ({ label: o.label, isCorrect: o.isCorrect, weight: o.weight })) },
+      },
+      include: { options: true },
+    });
+    return created;
   }
 }

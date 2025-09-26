@@ -18,3 +18,8 @@ export const updateQuestionDto = createQuestionDto.partial();
 
 export type CreateQuestionInput = z.infer<typeof createQuestionDto>;
 export type UpdateQuestionInput = z.infer<typeof updateQuestionDto>;
+
+export const reorderQuestionsDto = z.object({
+  orderedIds: z.array(z.string()).min(1),
+});
+export type ReorderQuestionsInput = z.infer<typeof reorderQuestionsDto>;

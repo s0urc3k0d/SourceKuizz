@@ -15,7 +15,7 @@ export class AuthService {
 
   async register(username: string, password: string) {
     const existing = await this.users.findByUsername(username);
-    if (existing) throw new UnauthorizedException('username_taken');
+    if (existing) throw new (require('@nestjs/common').ConflictException)('username_taken');
     const user = await this.users.createLocalUser(username, password);
     return this.issueTokens(user.id, username);
   }
