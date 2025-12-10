@@ -46,7 +46,7 @@ module.exports = {
     {
       name: 'sourcekuizz-frontend',
       cwd: '/var/www/sourcekuizz/packages/web',
-      script: 'node_modules/.bin/next',
+      script: 'node_modules/next/dist/bin/next',
       args: 'start -p 3008',
       interpreter: 'node',
       instances: 1,
