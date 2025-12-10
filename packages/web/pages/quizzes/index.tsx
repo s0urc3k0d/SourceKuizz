@@ -4,6 +4,7 @@ import { useRouter } from 'next/router';
 import { useAuthStore } from '../../src/store/auth';
 import { apiFetch } from '../../src/lib/api';
 import Link from 'next/link';
+import Header from '../../src/components/Header';
 
 type Quiz = {
   id: string;
@@ -114,17 +115,22 @@ export default function QuizzesPage() {
   // Rediriger vers login si pas connecte
   if (!access) {
     return (
-      <div className="page flex flex-col items-center justify-center gap-4" style={{ minHeight: '60vh' }}>
-        <div style={{ fontSize: 64 }}>📚</div>
-        <h1>Mes Quizzes</h1>
-        <p className="text-muted">Connectez-vous pour gerer vos quizzes</p>
-        <Link href="/login"><button className="btn-lg">Se connecter</button></Link>
-      </div>
+      <>
+        <Header />
+        <div className="page flex flex-col items-center justify-center gap-4" style={{ minHeight: '60vh' }}>
+          <div style={{ fontSize: 64 }}>📚</div>
+          <h1>Mes Quizzes</h1>
+          <p className="text-muted">Connectez-vous pour gerer vos quizzes</p>
+          <Link href="/login"><button className="btn-lg">Se connecter</button></Link>
+        </div>
+      </>
     );
   }
 
   return (
-    <div className="page container">
+    <>
+      <Header />
+      <div className="page container">
       {/* Header */}
       <div className="flex items-center justify-between mb-6" style={{ flexWrap: 'wrap', gap: 16 }}>
         <div>
@@ -284,5 +290,6 @@ export default function QuizzesPage() {
         </>
       )}
     </div>
+    </>
   );
 }

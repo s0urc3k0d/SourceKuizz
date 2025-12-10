@@ -4,6 +4,7 @@ import { loginApi, registerApi } from '../src/lib/api';
 import { useUIStore } from '../src/store/ui';
 import { useAuthStore } from '../src/store/auth';
 import Link from 'next/link';
+import Header from '../src/components/Header';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || '';
 
@@ -56,7 +57,9 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="page flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', minHeight: '100vh' }}>
+    <>
+      <Header />
+      <div className="page flex items-center justify-center" style={{ background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', minHeight: '100vh' }}>
       <div className="card animate-fade-in" style={{ width: '100%', maxWidth: 420, padding: 32 }}>
         {/* Logo */}
         <div className="text-center mb-4">
@@ -164,5 +167,6 @@ export default function LoginPage() {
         </div>
       </div>
     </div>
+    </>
   );
 }

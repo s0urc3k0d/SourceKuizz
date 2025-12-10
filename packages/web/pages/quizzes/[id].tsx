@@ -4,6 +4,7 @@ import { useUIStore } from '../../src/store/ui';
 import { useAuthStore } from '../../src/store/auth';
 import { apiFetch } from '../../src/lib/api';
 import { useAuthGuard } from '../../src/lib/useAuthGuard';
+import Header from '../../src/components/Header';
 
 type Option = { id?: string; label: string; isCorrect?: boolean; weight?: number };
 type Question = { id: string; type: 'mcq'|'multi'|'bool'; prompt: string; mediaUrl?: string|null; timeLimitMs: number; order: number; options: Option[] };
@@ -130,9 +131,11 @@ export default function QuizEditorPage() {
   }
 
   return (
-    <main style={{ padding: 24, display: 'grid', gap: 16 }}>
-      <h1>Édition Quiz – {quizId}</h1>
-      <button onClick={()=>push('/quizzes')}>← Retour</button>
+    <>
+      <Header />
+      <main style={{ padding: 24, display: 'grid', gap: 16 }}>
+        <h1>Édition Quiz – {quizId}</h1>
+        <button onClick={()=>push('/quizzes')}>← Retour</button>
 
       <section style={{ display: 'grid', gap: 8, maxWidth: 800 }}>
         <h3>Créer une question</h3>
@@ -236,5 +239,6 @@ export default function QuizEditorPage() {
         )}
       </section>
     </main>
+    </>
   );
 }

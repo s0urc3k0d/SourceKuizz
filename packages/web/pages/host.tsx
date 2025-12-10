@@ -9,6 +9,7 @@ import { ReactionBar } from '../src/components/ReactionBar';
 import { FloatingReactions } from '../src/components/FloatingReactions';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
+import Header from '../src/components/Header';
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'http://localhost:3001';
 
@@ -46,8 +47,14 @@ export default function HostPage() {
   // Charger les quizzes de l'utilisateur
   useEffect(() => {
     if (!access) return;
-    apiFetch('/quizzes').then(res => res.json()).then(data => {
-      if (Array.isArray(data)) setQuizzes(data);
+    apiFetch('/quizzes').then(res => res.json()).then(result => {
+      // L'API retourne { data: Quiz[], meta: {...} }
+      if (result && Array.isArray(result.data)) {
+        setQuizzes(result.data);
+      } else if (Array.isArray(result)) {
+        // Fallback si l'API retourne directement un tableau
+        setQuizzes(result);
+      }
     }).catch(() => {});
   }, [access]);
 
@@ -185,17 +192,22 @@ export default function HostPage() {
   // Rediriger vers login si pas connecte
   if (!access) {
     return (
-      <div className="page flex flex-col items-center justify-center gap-4" style={{ minHeight: '60vh' }}>
-        <div style={{ fontSize: 64 }}>🔒</div>
-        <h1>Connexion requise</h1>
-        <p className="text-muted">Connectez-vous pour heberger une session</p>
-        <Link href="/login"><button className="btn-lg">Se connecter</button></Link>
-      </div>
+      <>
+        <Header />
+        <div className="page flex flex-col items-center justify-center gap-4" style={{ minHeight: '60vh' }}>
+          <div style={{ fontSize: 64 }}>🔒</div>
+          <h1>Connexion requise</h1>
+          <p className="text-muted">Connectez-vous pour heberger une session</p>
+          <Link href="/login"><button className="btn-lg">Se connecter</button></Link>
+        </div>
+      </>
     );
   }
 
   return (
-    <div className="page container" style={{ maxWidth: 1000 }}>
+    <>
+      <Header />
+      <div className="page container" style={{ maxWidth: 1000 }}>
       <ReactionBar socket={socket} code={code} />
       <FloatingReactions />
 
@@ -544,5 +556,6 @@ export default function HostPage() {
         )}
       </div>
     </div>
+    </>
   );
 }
