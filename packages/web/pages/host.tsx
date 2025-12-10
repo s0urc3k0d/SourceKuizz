@@ -13,13 +13,37 @@ import Header from '../src/components/Header';
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'http://localhost:3001';
 
+type Quiz = { id: string; title: string };
+type Session = {
+  id: string;
+  code: string;
+  quizId: string;
+  quizTitle: string;
+  createdAt: string;
+  playerCount: number;
+  status: string;
+  isLive: boolean;
+};
+
 export default function HostPage() {
   const router = useRouter();
   const access = useAuthStore(s => s.accessToken);
   const user = useAuthStore(s => s.user);
-  const [quizId, setQuizId] = useState<string>('');
-  const [quizzes, setQuizzes] = useState<{ id: string; title: string }[]>([]);
-  const [code, setCode] = useState<string>('');
+  
+  // Mode: 'hub' = liste des sessions, 'active' = session active
+  const [mode, setMode] = useState<'hub' | 'active'>('hub');
+  const [activeCode, setActiveCode] = useState<string>('');
+  const [activeQuizId, setActiveQuizId] = useState<string>('');
+  
+  // Hub state
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [quizzes, setQuizzes] = useState<Quiz[]>([]);
+  const [loadingSessions, setLoadingSessions] = useState(true);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [selectedQuizId, setSelectedQuizId] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  // Active session state
   const session = useSessionStore();
   const socket = useMemo(() => access ? createSocket(WS_URL, access) : null, [access]);
   const addToast = useUIStore((s) => s.addToast);
@@ -44,96 +68,167 @@ export default function HostPage() {
     return ps;
   }, [session.players, session.leaderboard, session.hostId]);
 
-  // Charger les quizzes de l'utilisateur
+  // Charger les sessions et quizzes
   useEffect(() => {
     if (!access) return;
-    apiFetch('/quizzes').then(res => res.json()).then(result => {
-      // L'API retourne { data: Quiz[], meta: {...} }
-      const quizList = result && Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
-      setQuizzes(quizList);
-      
-      // Vérifier si le quizId stocké existe encore dans la liste
-      const storedQuizId = localStorage.getItem('quizId');
-      if (storedQuizId) {
-        const exists = quizList.some((q: { id: string }) => q.id === storedQuizId);
-        if (exists) {
-          setQuizId(storedQuizId);
-        } else {
-          // Quiz supprimé ou invalide, nettoyer le localStorage
-          localStorage.removeItem('quizId');
-          localStorage.removeItem('code');
-        }
-      }
-    }).catch(() => {});
+    loadData();
   }, [access]);
 
+  async function loadData() {
+    setLoadingSessions(true);
+    try {
+      const [sessionsRes, quizzesRes] = await Promise.all([
+        apiFetch('/sessions/my'),
+        apiFetch('/quizzes'),
+      ]);
+      
+      if (sessionsRes.ok) {
+        const data = await sessionsRes.json();
+        setSessions(Array.isArray(data) ? data : []);
+      }
+      
+      if (quizzesRes.ok) {
+        const result = await quizzesRes.json();
+        const quizList = result?.data || result || [];
+        setQuizzes(Array.isArray(quizList) ? quizList : []);
+      }
+    } catch (e) {
+      console.error('Failed to load data:', e);
+    } finally {
+      setLoadingSessions(false);
+    }
+  }
+
+  // Socket handlers
   useEffect(() => {
     if (!socket) return;
     bindSocketHandlers(socket);
     return () => { socket.disconnect(); };
   }, [socket]);
 
-  async function ensureSession() {
-    if (!quizId) {
-      addToast({ type: 'warning', message: 'Selectionnez un quiz' });
-      return;
-    }
-    const res = await apiFetch('/sessions/ensure', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quizId, code: code || undefined })
-    });
-    const json = await res.json();
-    setCode(json.code);
-    localStorage.setItem('code', json.code);
-    localStorage.setItem('quizId', quizId);
-    if (socket) {
-      wsApi(socket).joinSession({ code: json.code, quizId, nickname: user?.username || 'Host' });
-      addToast({ type: 'success', message: 'Session creee !' });
-    }
-  }
-
-  // Charger le code de session depuis localStorage (le quizId est chargé après validation dans l'effet ci-dessus)
+  // Rejoindre automatiquement une session active
   useEffect(() => {
-    try {
-      const c = localStorage.getItem('code');
-      if (c) setCode(c);
-    } catch {}
-  }, []);
-
-  useEffect(() => {
-    if (!socket) return;
+    if (!socket || mode !== 'active' || !activeCode || !activeQuizId) return;
     const onConnect = () => {
-      const key = `${code}|${quizId}`;
-      if (code && quizId && key !== lastJoinKeyRef.current) {
+      const key = `${activeCode}|${activeQuizId}`;
+      if (key !== lastJoinKeyRef.current) {
         lastJoinKeyRef.current = key;
-        wsApi(socket).joinSession({ code, quizId, nickname: user?.username || 'Host' });
+        wsApi(socket).joinSession({ code: activeCode, quizId: activeQuizId, nickname: user?.username || 'Host' });
       }
     };
     socket.on('connect', onConnect);
+    if (socket.connected) onConnect();
     return () => { socket.off('connect', onConnect); };
-  }, [socket, code, quizId, user?.username]);
+  }, [socket, mode, activeCode, activeQuizId, user?.username]);
 
-  function startQuestion() { if (socket && code) wsApi(socket).startQuestion({ code }); }
-  function forceReveal() { if (socket && code) wsApi(socket).forceReveal({ code }); }
-  function advanceNext() { if (socket && code) wsApi(socket).advanceNext({ code }); }
-  function toggleAutoNext(e: any) { if (socket && code) wsApi(socket).toggleAutoNext({ code, enabled: e.target.checked }); }
-  function transferHost(targetPlayerId: string) { if (socket && code) wsApi(socket).transferHost({ code, targetPlayerId }); }
-  function toggleSpectatorReactions(e: any) { if (socket && code) wsApi(socket).toggleSpectatorReactions({ code, enabled: e.target.checked }); }
-  
+  // Auto-set bot channel
+  useEffect(() => {
+    if (user?.username && !botChannel) {
+      setBotChannel(user.username);
+    }
+  }, [user?.username, botChannel]);
+
+  // Créer une nouvelle session
+  async function createSession() {
+    if (!selectedQuizId) {
+      addToast({ type: 'warning', message: 'Sélectionnez un quiz' });
+      return;
+    }
+    setCreating(true);
+    try {
+      const res = await apiFetch('/sessions/ensure', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quizId: selectedQuizId }),
+      });
+      const json = await res.json();
+      if (json.code) {
+        setShowCreateModal(false);
+        setActiveCode(json.code);
+        setActiveQuizId(selectedQuizId);
+        setMode('active');
+        addToast({ type: 'success', message: 'Session créée !' });
+        loadData(); // Rafraîchir la liste
+      }
+    } catch {
+      addToast({ type: 'error', message: 'Échec de création' });
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  // Rejoindre une session existante
+  function joinSession(sess: Session) {
+    setActiveCode(sess.code);
+    setActiveQuizId(sess.quizId);
+    setMode('active');
+    if (socket) {
+      wsApi(socket).joinSession({ code: sess.code, quizId: sess.quizId, nickname: user?.username || 'Host' });
+    }
+  }
+
+  // Supprimer une session
+  async function deleteSession(code: string) {
+    if (!confirm('Supprimer cette session ? Cette action est irréversible.')) return;
+    try {
+      const res = await apiFetch(`/sessions/${code}`, { method: 'DELETE' });
+      if (res.ok) {
+        setSessions(s => s.filter(sess => sess.code !== code));
+        addToast({ type: 'success', message: 'Session supprimée' });
+      } else {
+        throw new Error();
+      }
+    } catch {
+      addToast({ type: 'error', message: 'Échec de suppression' });
+    }
+  }
+
+  // Retourner au hub
+  function backToHub() {
+    setMode('hub');
+    setActiveCode('');
+    setActiveQuizId('');
+    lastJoinKeyRef.current = '';
+    // Reset session store state
+    useSessionStore.setState({
+      code: undefined,
+      status: 'lobby',
+      questionIndex: 0,
+      totalQuestions: 0,
+      remainingMs: 0,
+      isHost: undefined,
+      isSpectator: undefined,
+      autoNext: undefined,
+      hostId: undefined,
+      selfId: undefined,
+      leaderboard: [],
+      players: undefined,
+      spectators: undefined,
+    });
+    loadData();
+  }
+
+  // Fonctions de contrôle de session
+  function startQuestion() { if (socket && activeCode) wsApi(socket).startQuestion({ code: activeCode }); }
+  function forceReveal() { if (socket && activeCode) wsApi(socket).forceReveal({ code: activeCode }); }
+  function advanceNext() { if (socket && activeCode) wsApi(socket).advanceNext({ code: activeCode }); }
+  function toggleAutoNext(e: any) { if (socket && activeCode) wsApi(socket).toggleAutoNext({ code: activeCode, enabled: e.target.checked }); }
+  function transferHost(targetPlayerId: string) { if (socket && activeCode) wsApi(socket).transferHost({ code: activeCode, targetPlayerId }); }
+  function toggleSpectatorReactions(e: any) { if (socket && activeCode) wsApi(socket).toggleSpectatorReactions({ code: activeCode, enabled: e.target.checked }); }
+
   function copy(text: string) {
     try {
       navigator.clipboard.writeText(text);
-      addToast({ type: 'success', message: 'Lien copie !' });
+      addToast({ type: 'success', message: 'Copié !' });
     } catch {
-      addToast({ type: 'error', message: 'Echec de la copie' });
+      addToast({ type: 'error', message: 'Échec de la copie' });
     }
   }
 
   // Twitch Bot functions
   async function connectTwitchBot() {
-    if (!code || !botChannel.trim()) {
-      addToast({ type: 'warning', message: 'Entrez le nom de la chaine Twitch' });
+    if (!activeCode || !botChannel.trim()) {
+      addToast({ type: 'warning', message: 'Entrez le nom de la chaîne Twitch' });
       return;
     }
     setBotLoading(true);
@@ -141,13 +236,13 @@ export default function HostPage() {
       const res = await apiFetch('/twitch-bot/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel: botChannel.trim().toLowerCase(), sessionCode: code })
+        body: JSON.stringify({ channel: botChannel.trim().toLowerCase(), sessionCode: activeCode }),
       });
-      if (!res.ok) throw new Error('Failed to connect bot');
+      if (!res.ok) throw new Error();
       setBotConnected(true);
-      addToast({ type: 'success', message: `Bot connecte a #${botChannel}` });
+      addToast({ type: 'success', message: `Bot connecté à #${botChannel}` });
     } catch {
-      addToast({ type: 'error', message: 'Echec de connexion du bot' });
+      addToast({ type: 'error', message: 'Échec de connexion du bot' });
     } finally {
       setBotLoading(false);
     }
@@ -157,47 +252,20 @@ export default function HostPage() {
     if (!botChannel) return;
     setBotLoading(true);
     try {
-      await apiFetch(`/twitch-bot/disconnect/${botChannel.trim().toLowerCase()}`, {
-        method: 'DELETE'
-      });
+      await apiFetch(`/twitch-bot/disconnect/${botChannel.trim().toLowerCase()}`, { method: 'DELETE' });
       setBotConnected(false);
-      addToast({ type: 'info', message: 'Bot deconnecte' });
+      addToast({ type: 'info', message: 'Bot déconnecté' });
     } catch {
-      addToast({ type: 'error', message: 'Echec de deconnexion' });
+      addToast({ type: 'error', message: 'Échec de déconnexion' });
     } finally {
       setBotLoading(false);
     }
   }
 
-  // Auto-set bot channel from user's Twitch username
-  useEffect(() => {
-    if (user?.username && !botChannel) {
-      setBotChannel(user.username);
-    }
-  }, [user?.username, botChannel]);
+  const joinUrl = typeof window !== 'undefined' && activeCode ? `${window.location.origin}/play/${activeCode}` : '';
+  const spectateUrl = typeof window !== 'undefined' && activeCode ? `${window.location.origin}/spectate/${activeCode}` : '';
 
-  async function replayQuiz() {
-    if (!quizId) return;
-    try {
-      const res = await apiFetch('/sessions/ensure', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quizId })
-      });
-      const json = await res.json();
-      setCode(json.code);
-      localStorage.setItem('code', json.code);
-      if (socket) wsApi(socket).joinSession({ code: json.code, quizId, nickname: user?.username || 'Host' });
-      addToast({ type: 'success', message: 'Nouvelle session creee' });
-    } catch {
-      addToast({ type: 'error', message: 'Echec de creation' });
-    }
-  }
-
-  const joinUrl = typeof window !== 'undefined' && code ? `${window.location.origin}/play/${code}` : '';
-  const spectateUrl = typeof window !== 'undefined' && code ? `${window.location.origin}/spectate/${code}` : '';
-
-  // Rediriger vers login si pas connecte
+  // Non connecté
   if (!access) {
     return (
       <>
@@ -205,90 +273,226 @@ export default function HostPage() {
         <div className="page flex flex-col items-center justify-center gap-4" style={{ minHeight: '60vh' }}>
           <div style={{ fontSize: 64 }}>🔒</div>
           <h1>Connexion requise</h1>
-          <p className="text-muted">Connectez-vous pour heberger une session</p>
+          <p className="text-muted">Connectez-vous pour héberger une session</p>
           <Link href="/login"><button className="btn-lg">Se connecter</button></Link>
         </div>
       </>
     );
   }
 
+  // Mode HUB - Liste des sessions
+  if (mode === 'hub') {
+    return (
+      <>
+        <Header />
+        <div className="page container" style={{ maxWidth: 900 }}>
+          {/* Header */}
+          <div className="flex items-center justify-between mb-6" style={{ flexWrap: 'wrap', gap: 16 }}>
+            <div>
+              <h1 style={{ fontSize: 28, fontWeight: 700 }}>Mes Sessions</h1>
+              <p className="text-muted">Gérez vos parties de quiz</p>
+            </div>
+            <button onClick={() => setShowCreateModal(true)} className="btn-success">
+              + Nouvelle Session
+            </button>
+          </div>
+
+          {/* Liste des sessions */}
+          {loadingSessions ? (
+            <div className="text-center text-muted" style={{ padding: 48 }}>
+              Chargement...
+            </div>
+          ) : sessions.length === 0 ? (
+            <div className="card text-center" style={{ padding: 48 }}>
+              <div style={{ fontSize: 64, marginBottom: 16 }}>🎮</div>
+              <h2 style={{ marginBottom: 8 }}>Aucune session</h2>
+              <p className="text-muted mb-4">Créez votre première session pour commencer</p>
+              <button onClick={() => setShowCreateModal(true)}>Créer une session</button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {sessions.map(sess => (
+                <div key={sess.code} className="card" style={{ padding: 16 }}>
+                  <div className="flex items-center gap-4" style={{ flexWrap: 'wrap' }}>
+                    {/* Info principale */}
+                    <div style={{ flex: 1, minWidth: 200 }}>
+                      <div className="flex items-center gap-2 mb-1">
+                        <span className="font-bold" style={{ fontSize: 18 }}>{sess.quizTitle}</span>
+                        {sess.isLive && (
+                          <span className="badge badge-success" style={{ fontSize: 11 }}>
+                            🔴 EN DIRECT
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-3 text-sm text-muted">
+                        <span>Code: <strong>{sess.code}</strong></span>
+                        <span>•</span>
+                        <span>{sess.playerCount} joueur{sess.playerCount !== 1 ? 's' : ''}</span>
+                        <span>•</span>
+                        <span>{new Date(sess.createdAt).toLocaleDateString('fr-FR')}</span>
+                      </div>
+                    </div>
+
+                    {/* Status */}
+                    <div>
+                      <span className={`badge ${sess.status === 'finished' ? 'badge-secondary' : sess.status === 'lobby' ? 'badge-warning' : 'badge-primary'}`}>
+                        {sess.status === 'finished' ? 'Terminée' : sess.status === 'lobby' ? 'En attente' : 'En cours'}
+                      </span>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex gap-2">
+                      {sess.isLive ? (
+                        <button onClick={() => joinSession(sess)}>
+                          Rejoindre
+                        </button>
+                      ) : (
+                        <Link href={`/summary/${sess.code}`}>
+                          <button className="btn-secondary">Résumé</button>
+                        </Link>
+                      )}
+                      <button
+                        className="btn-ghost"
+                        onClick={() => deleteSession(sess.code)}
+                        title="Supprimer"
+                        style={{ color: 'var(--error)', padding: '8px' }}
+                      >
+                        🗑️
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Modal de création */}
+          {showCreateModal && (
+            <>
+              <div
+                style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 100 }}
+                onClick={() => setShowCreateModal(false)}
+              />
+              <div
+                className="card animate-fade-in"
+                style={{
+                  position: 'fixed',
+                  top: '50%',
+                  left: '50%',
+                  transform: 'translate(-50%, -50%)',
+                  width: '90%',
+                  maxWidth: 450,
+                  zIndex: 101,
+                  padding: 24,
+                }}
+              >
+                <h2 style={{ marginBottom: 16 }}>Nouvelle Session</h2>
+                
+                {quizzes.length === 0 ? (
+                  <div className="text-center" style={{ padding: 24 }}>
+                    <p className="text-muted mb-4">Vous n'avez pas encore de quiz</p>
+                    <Link href="/quizzes">
+                      <button>Créer un quiz</button>
+                    </Link>
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ marginBottom: 16 }}>
+                      <label className="text-sm font-semibold" style={{ display: 'block', marginBottom: 6 }}>
+                        Sélectionnez un quiz
+                      </label>
+                      <select
+                        value={selectedQuizId}
+                        onChange={(e) => setSelectedQuizId(e.target.value)}
+                        style={{ width: '100%' }}
+                      >
+                        <option value="">-- Choisir un quiz --</option>
+                        {quizzes.map(q => (
+                          <option key={q.id} value={q.id}>{q.title}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="flex gap-3">
+                      <button
+                        onClick={createSession}
+                        disabled={creating || !selectedQuizId}
+                        style={{ flex: 1 }}
+                      >
+                        {creating ? 'Création...' : 'Créer'}
+                      </button>
+                      <button
+                        className="btn-secondary"
+                        onClick={() => setShowCreateModal(false)}
+                      >
+                        Annuler
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </>
+    );
+  }
+
+  // Mode ACTIVE - Session en cours
   return (
     <>
       <Header />
       <div className="page container" style={{ maxWidth: 1000 }}>
-      <ReactionBar socket={socket} code={code} />
-      <FloatingReactions />
+        <ReactionBar socket={socket} code={activeCode} />
+        <FloatingReactions />
 
-      {/* Header */}
-      <div className="flex items-center justify-between mb-6" style={{ flexWrap: 'wrap', gap: 16 }}>
-        <div>
-          <h1 style={{ fontSize: 28, fontWeight: 700 }}>Mode Hote</h1>
-          <p className="text-muted">Creez et gerez votre session de quiz</p>
-        </div>
-        {code && (
-          <div className="badge badge-primary" style={{ fontSize: 18, padding: '8px 16px' }}>
-            Code: {code}
-          </div>
-        )}
-      </div>
-
-      {/* Session terminee */}
-      {session.status === 'finished' && code && (
-        <div className="card mb-4" style={{ background: 'linear-gradient(135deg, #fef3c7 0%, #fde68a 100%)', border: 'none' }}>
-          <div className="flex items-center gap-3 mb-4">
-            <span style={{ fontSize: 32 }}>🎉</span>
+        {/* Header avec bouton retour */}
+        <div className="flex items-center justify-between mb-6" style={{ flexWrap: 'wrap', gap: 16 }}>
+          <div className="flex items-center gap-3">
+            <button className="btn-ghost" onClick={backToHub} style={{ padding: 8 }}>
+              ← Retour
+            </button>
             <div>
-              <h3 style={{ fontWeight: 600 }}>Session terminee !</h3>
-              <p className="text-muted">Consultez les resultats ou relancez une partie</p>
+              <h1 style={{ fontSize: 24, fontWeight: 700 }}>Session {activeCode}</h1>
+              <p className="text-muted">
+                {quizzes.find(q => q.id === activeQuizId)?.title || 'Quiz'}
+              </p>
             </div>
           </div>
-          <div className="flex gap-3" style={{ flexWrap: 'wrap' }}>
-            <button onClick={() => router.push(`/summary/${code}`)}>Voir le resume</button>
-            <button className="btn-secondary" onClick={replayQuiz}>Rejouer ce quiz</button>
+          <div className="badge badge-primary" style={{ fontSize: 18, padding: '8px 16px' }}>
+            Code: {activeCode}
           </div>
         </div>
-      )}
 
-      <div className="grid" style={{ gridTemplateColumns: code ? '1fr 320px' : '1fr', gap: 24 }}>
-        {/* Main Content */}
-        <div className="flex flex-col gap-4">
-          {/* Configuration */}
-          {!code && (
-            <div className="card">
-              <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>Configuration</h2>
-              <div className="flex flex-col gap-4">
-                <div>
-                  <label className="text-sm font-semibold" style={{ display: 'block', marginBottom: 6 }}>
-                    Selectionnez un quiz
-                  </label>
-                  <select
-                    value={quizId}
-                    onChange={(e) => setQuizId(e.target.value)}
-                    style={{ width: '100%' }}
-                  >
-                    <option value="">-- Choisir un quiz --</option>
-                    {quizzes.map(q => (
-                      <option key={q.id} value={q.id}>{q.title}</option>
-                    ))}
-                  </select>
-                </div>
-                <button className="btn-lg" disabled={!quizId} onClick={ensureSession}>
-                  Creer la session
-                </button>
+        {/* Session terminée */}
+        {session.status === 'finished' && (
+          <div className="card mb-4" style={{ background: 'linear-gradient(135deg, #fef3c7 0%, #fde68a 100%)', border: 'none' }}>
+            <div className="flex items-center gap-3 mb-4">
+              <span style={{ fontSize: 32 }}>🎉</span>
+              <div>
+                <h3 style={{ fontWeight: 600 }}>Session terminée !</h3>
+                <p className="text-muted">Consultez les résultats ou créez une nouvelle partie</p>
               </div>
             </div>
-          )}
+            <div className="flex gap-3" style={{ flexWrap: 'wrap' }}>
+              <button onClick={() => router.push(`/summary/${activeCode}`)}>Voir le résumé</button>
+              <button className="btn-secondary" onClick={backToHub}>Retour au hub</button>
+            </div>
+          </div>
+        )}
 
-          {/* Controles de jeu */}
-          {code && (
+        <div className="grid" style={{ gridTemplateColumns: '1fr 320px', gap: 24 }}>
+          {/* Main Content */}
+          <div className="flex flex-col gap-4">
+            {/* Contrôles de jeu */}
             <div className="card">
               <div className="flex items-center justify-between mb-4">
-                <h2 style={{ fontSize: 18, fontWeight: 600 }}>Controles</h2>
+                <h2 style={{ fontSize: 18, fontWeight: 600 }}>Contrôles</h2>
                 <div className="badge">
                   {session.status === 'lobby' && 'En attente'}
                   {session.status === 'question' && 'Question en cours'}
                   {session.status === 'reveal' && 'Correction'}
-                  {session.status === 'finished' && 'Termine'}
+                  {session.status === 'finished' && 'Terminé'}
                 </div>
               </div>
 
@@ -313,14 +517,14 @@ export default function HostPage() {
                   disabled={!session.isHost || !(session.status === 'lobby' || session.status === 'reveal')}
                   className="btn-success"
                 >
-                  ▶ Demarrer
+                  ▶ Démarrer
                 </button>
                 <button
                   onClick={forceReveal}
                   disabled={!session.isHost || session.status !== 'question'}
                   className="btn-secondary"
                 >
-                  Reveler
+                  Révéler
                 </button>
                 <button
                   onClick={advanceNext}
@@ -349,34 +553,32 @@ export default function HostPage() {
                     onChange={toggleSpectatorReactions}
                     disabled={!session.isHost}
                   />
-                  <span className="text-sm">Reactions spectateurs</span>
+                  <span className="text-sm">Réactions spectateurs</span>
                 </label>
               </div>
             </div>
-          )}
 
-          {/* Leaderboard */}
-          {code && session.leaderboard.length > 0 && (
-            <div className="card">
-              <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>Classement</h2>
-              <div className="flex flex-col gap-2">
-                {session.leaderboard.slice(0, 10).map((entry, i) => (
-                  <div key={entry.playerId} className="leaderboard-item">
-                    <div className={`leaderboard-rank ${i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : ''}`}>
-                      {entry.rank}
+            {/* Leaderboard */}
+            {session.leaderboard.length > 0 && (
+              <div className="card">
+                <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>Classement</h2>
+                <div className="flex flex-col gap-2">
+                  {session.leaderboard.slice(0, 10).map((entry, i) => (
+                    <div key={entry.playerId} className="leaderboard-item">
+                      <div className={`leaderboard-rank ${i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : ''}`}>
+                        {entry.rank}
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div className="font-semibold">{entry.nickname}</div>
+                      </div>
+                      <div className="font-bold" style={{ color: 'var(--primary)' }}>{entry.score} pts</div>
                     </div>
-                    <div style={{ flex: 1 }}>
-                      <div className="font-semibold">{entry.nickname}</div>
-                    </div>
-                    <div className="font-bold" style={{ color: 'var(--primary)' }}>{entry.score} pts</div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
-            </div>
-          )}
+            )}
 
-          {/* Joueurs */}
-          {code && (
+            {/* Joueurs */}
             <div className="card">
               <h2 style={{ fontSize: 18, fontWeight: 600, marginBottom: 16 }}>
                 Joueurs ({playersSorted.length})
@@ -415,7 +617,7 @@ export default function HostPage() {
                             className="btn-sm btn-ghost"
                             onClick={() => transferHost(pl.id)}
                           >
-                            Transferer
+                            Transférer
                           </button>
                         )}
                       </div>
@@ -424,12 +626,11 @@ export default function HostPage() {
                 </div>
               )}
             </div>
-          )}
-        </div>
+          </div>
 
-        {/* Sidebar - Partage */}
-        {code && (
+          {/* Sidebar */}
           <div className="flex flex-col gap-4">
+            {/* Partage */}
             <div className="card text-center">
               <h3 style={{ fontWeight: 600, marginBottom: 16 }}>Partager</h3>
               
@@ -483,13 +684,13 @@ export default function HostPage() {
                 Bot Twitch
               </h3>
               <p className="text-sm text-muted mb-3">
-                Permettez aux viewers de rejoindre et repondre via le chat Twitch
+                Permettez aux viewers de rejoindre et répondre via le chat Twitch
               </p>
               
               <div className="flex flex-col gap-3">
                 <div>
                   <label className="text-sm" style={{ display: 'block', marginBottom: 4 }}>
-                    Chaine Twitch
+                    Chaîne Twitch
                   </label>
                   <input
                     type="text"
@@ -515,7 +716,7 @@ export default function HostPage() {
                     disabled={botLoading}
                     className="btn-secondary"
                   >
-                    {botLoading ? 'Deconnexion...' : 'Deconnecter'}
+                    {botLoading ? 'Déconnexion...' : 'Déconnecter'}
                   </button>
                 )}
 
@@ -524,9 +725,9 @@ export default function HostPage() {
                     background: 'rgba(34, 197, 94, 0.1)', 
                     color: '#22c55e',
                     padding: '8px 12px',
-                    borderRadius: 'var(--radius)'
+                    borderRadius: 'var(--radius)',
                   }}>
-                    ✓ Bot connecte a #{botChannel}
+                    ✓ Bot connecté à #{botChannel}
                   </div>
                 )}
 
@@ -534,7 +735,7 @@ export default function HostPage() {
                   <strong>Commandes disponibles:</strong>
                   <ul style={{ marginTop: 4, paddingLeft: 16 }}>
                     <li><code>!join</code> - Rejoindre le quiz</li>
-                    <li><code>!1</code> <code>!2</code> <code>!3</code> <code>!4</code> - Repondre</li>
+                    <li><code>!1</code> <code>!2</code> <code>!3</code> <code>!4</code> - Répondre</li>
                     <li><code>!score</code> - Voir son score</li>
                     <li><code>!rank</code> - Voir son classement</li>
                     <li><code>!leave</code> - Quitter</li>
@@ -550,20 +751,19 @@ export default function HostPage() {
                 Overlay OBS
               </h3>
               <p className="text-sm text-muted mb-3">
-                Ajoutez l'overlay a votre stream OBS
+                Ajoutez l'overlay à votre stream OBS
               </p>
               <button 
                 className="btn-sm" 
-                onClick={() => copy(`${typeof window !== 'undefined' ? window.location.origin : ''}/overlay/${code}`)}
+                onClick={() => copy(`${typeof window !== 'undefined' ? window.location.origin : ''}/overlay/${activeCode}`)}
                 style={{ width: '100%' }}
               >
                 Copier le lien overlay
               </button>
             </div>
           </div>
-        )}
+        </div>
       </div>
-    </div>
     </>
   );
 }

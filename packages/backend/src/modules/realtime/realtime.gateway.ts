@@ -1094,6 +1094,25 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     };
   }
 
+  /** Ferme une session (déconnecte tous les joueurs et nettoie) */
+  public closeSession(code: string) {
+    const session = this.sessions.get(code);
+    if (!session) return;
+
+    // Notifier tous les joueurs et spectateurs
+    this.server.to(code).emit('session_closed', { reason: 'deleted' });
+    
+    // Déconnecter tous les sockets de la room
+    this.server.in(code).socketsLeave(code);
+    
+    // Nettoyer les timers et la session
+    this.clearTimer(session);
+    if (session.detached) session.detached.clear();
+    this.sessions.delete(code);
+    
+    this.logger.log(`Session ${code} closed and deleted`);
+  }
+
   // Donne l'identifiant de la question courante dans une session (ou undefined)
   public getCurrentQuestionId(code: string): string | undefined {
     const s = this.sessions.get(code);

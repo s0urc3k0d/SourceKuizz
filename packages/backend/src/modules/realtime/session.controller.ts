@@ -1,13 +1,96 @@
-import { Controller, Get, Post, Query, Param, Body, UseGuards, BadRequestException, NotFoundException, Header } from '@nestjs/common';
+import { Controller, Get, Post, Delete, Query, Param, Body, UseGuards, BadRequestException, NotFoundException, ForbiddenException, Header } from '@nestjs/common';
 import { RealtimeGateway } from './realtime.gateway';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { CurrentUser } from '../auth/current-user.decorator';
 import { PrismaService } from '../database/prisma.service';
 import { GamePlayer, PlayerAnswer, Question } from '@prisma/client';
-import { ensureSessionDtoSchema, EnsureSessionDto } from '../../types';
+import { ensureSessionDtoSchema, EnsureSessionDto, AuthenticatedUser } from '../../types';
 
 @Controller('sessions')
 export class SessionController {
   constructor(private readonly rt: RealtimeGateway, private readonly prisma: PrismaService) {}
+
+  // Lister les sessions de l'utilisateur (quizzes qu'il a créés)
+  @UseGuards(JwtAuthGuard)
+  @Get('my')
+  async listMySessions(@CurrentUser() user: AuthenticatedUser) {
+    // Récupérer les quizzes de l'utilisateur
+    const quizzes = await this.prisma.quiz.findMany({
+      where: { ownerId: user.id },
+      select: { id: true },
+    });
+    const quizIds = quizzes.map(q => q.id);
+    
+    if (quizIds.length === 0) return [];
+
+    // Récupérer les sessions liées à ces quizzes
+    const sessions = await this.prisma.gameSession.findMany({
+      where: { quizId: { in: quizIds } },
+      include: {
+        quiz: { select: { id: true, title: true } },
+        _count: { select: { players: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50, // Limiter à 50 sessions
+    });
+
+    // Enrichir avec l'état en temps réel
+    return sessions.map(session => {
+      const liveState = this.rt.getPublicState(session.code);
+      return {
+        id: session.id,
+        code: session.code,
+        quizId: session.quizId,
+        quizTitle: session.quiz?.title,
+        createdAt: session.createdAt,
+        playerCount: liveState?.playersCount ?? session._count.players,
+        status: liveState?.status ?? 'finished',
+        isLive: !!liveState,
+      };
+    });
+  }
+
+  // Supprimer une session
+  @UseGuards(JwtAuthGuard)
+  @Delete(':code')
+  async deleteSession(@Param('code') code: string, @CurrentUser() user: AuthenticatedUser) {
+    const session = await this.prisma.gameSession.findUnique({
+      where: { code },
+      include: { quiz: { select: { ownerId: true } } },
+    });
+    
+    if (!session) throw new NotFoundException('session_not_found');
+    if (session.quiz.ownerId !== user.id) throw new ForbiddenException('not_owner');
+
+    // Fermer la session en temps réel si elle existe
+    this.rt.closeSession(code);
+
+    // Supprimer les données en cascade
+    // D'abord les réponses des joueurs
+    const players = await this.prisma.gamePlayer.findMany({
+      where: { sessionId: session.id },
+      select: { id: true },
+    });
+    const playerIds = players.map(p => p.id);
+    
+    if (playerIds.length > 0) {
+      await this.prisma.playerAnswer.deleteMany({
+        where: { playerId: { in: playerIds } },
+      });
+    }
+    
+    // Puis les joueurs
+    await this.prisma.gamePlayer.deleteMany({
+      where: { sessionId: session.id },
+    });
+    
+    // Enfin la session
+    await this.prisma.gameSession.delete({
+      where: { id: session.id },
+    });
+
+    return { success: true };
+  }
 
   // Créer ou récupérer une session pour un quiz
   @UseGuards(JwtAuthGuard)
