@@ -49,11 +49,20 @@ export default function HostPage() {
     if (!access) return;
     apiFetch('/quizzes').then(res => res.json()).then(result => {
       // L'API retourne { data: Quiz[], meta: {...} }
-      if (result && Array.isArray(result.data)) {
-        setQuizzes(result.data);
-      } else if (Array.isArray(result)) {
-        // Fallback si l'API retourne directement un tableau
-        setQuizzes(result);
+      const quizList = result && Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
+      setQuizzes(quizList);
+      
+      // Vérifier si le quizId stocké existe encore dans la liste
+      const storedQuizId = localStorage.getItem('quizId');
+      if (storedQuizId) {
+        const exists = quizList.some((q: { id: string }) => q.id === storedQuizId);
+        if (exists) {
+          setQuizId(storedQuizId);
+        } else {
+          // Quiz supprimé ou invalide, nettoyer le localStorage
+          localStorage.removeItem('quizId');
+          localStorage.removeItem('code');
+        }
       }
     }).catch(() => {});
   }, [access]);
@@ -84,10 +93,9 @@ export default function HostPage() {
     }
   }
 
+  // Charger le code de session depuis localStorage (le quizId est chargé après validation dans l'effet ci-dessus)
   useEffect(() => {
     try {
-      const qz = localStorage.getItem('quizId');
-      if (qz) setQuizId(qz);
       const c = localStorage.getItem('code');
       if (c) setCode(c);
     } catch {}
