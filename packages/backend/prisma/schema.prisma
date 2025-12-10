@@ -9,15 +9,23 @@ datasource db {
 }
 
 model User {
-  id           String        @id @default(cuid())
-  username     String        @unique
-  passwordHash String?
-  twitchId     String?       @unique
-  avatarUrl    String?
-  createdAt    DateTime      @default(now())
-  quizzes      Quiz[]
-  sessions     AuthSession[]
-  gamePlayers  GamePlayer[]
+  id                      String                    @id @default(cuid())
+  username                String                    @unique
+  passwordHash            String?
+  twitchId                String?                   @unique
+  avatarUrl               String?
+  createdAt               DateTime                  @default(now())
+  quizzes                 Quiz[]
+  sessions                AuthSession[]
+  gamePlayers             GamePlayer[]
+  gameHistory             GameHistory[]             @relation("UserGameHistory")
+  profile                 UserProfile?              @relation("UserProfile")
+  notificationPreferences NotificationPreference?   @relation("NotificationPreferences")
+  badges                  UserBadge[]               @relation("UserBadges")
+  xp                      UserXP?                   @relation("UserXP")
+  streak                  UserStreak?               @relation("UserStreak")
+  leaderboardEntries      GlobalLeaderboard[]       @relation("GlobalLeaderboard")
+  apiKeys                 ApiKey[]                  @relation("ApiKeys")
 }
 
 model AuthSession {
@@ -41,6 +49,11 @@ model Quiz {
   owner       User       @relation(fields: [ownerId], references: [id])
   questions   Question[]
   gameSessions GameSession[]
+  // Mode blitz: temps réduit, questions rapides
+  isBlitzMode     Boolean    @default(false)
+  blitzTimeLimitMs Int?      // Temps par question en mode blitz (ex: 5000ms)
+  shuffleQuestions Boolean   @default(false)
+  shuffleOptions   Boolean   @default(false)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
 }
@@ -49,11 +62,15 @@ model Question {
   id          String           @id @default(cuid())
   quizId      String
   quiz        Quiz             @relation(fields: [quizId], references: [id])
-  type        String
+  type        String           // 'multiple_choice', 'true_false', 'text_input', 'ordering', 'blitz'
   prompt      String
   mediaUrl    String?
+  mediaType   String?          // 'image', 'video', 'audio'
   timeLimitMs Int
   order       Int
+  // Pour les questions texte libre
+  correctAnswers String?       // JSON array de réponses acceptées ["réponse1", "réponse2"]
+  caseSensitive  Boolean       @default(false)
   options     QuestionOption[]
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
@@ -64,10 +81,11 @@ model Question {
 model QuestionOption {
   id         String    @id @default(cuid())
   questionId String
-  question   Question  @relation(fields: [questionId], references: [id])
+  question   Question  @relation(fields: [questionId], references: [id], onDelete: Cascade)
   label      String
   isCorrect  Boolean   @default(false)
   weight     Int       @default(1)
+  orderIndex Int?      // Pour les questions d'ordre
   answers    PlayerAnswer[]
   @@index([questionId])
 }
@@ -108,10 +126,164 @@ model PlayerAnswer {
   question      Question        @relation(fields: [questionId], references: [id])
   optionId      String?
   option        QuestionOption? @relation(fields: [optionId], references: [id])
+  textAnswer    String?         // Pour les réponses texte libre
+  orderingAnswer String?        // JSON array de l'ordre soumis ["optId1", "optId2", ...]
   correct       Boolean
   timeMs        Int
   createdAt     DateTime        @default(now())
   uniqueKey     String          @unique // playerId:questionId
   @@index([questionId])
   @@index([optionId])
+}
+
+// ========================================
+// Phase 2: Historique & Profils
+// ========================================
+
+model GameHistory {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation("UserGameHistory", fields: [userId], references: [id], onDelete: Cascade)
+  sessionCode   String
+  quizId        String
+  quizTitle     String
+  score         Int
+  rank          Int
+  totalPlayers  Int
+  correctCount  Int
+  totalQuestions Int
+  avgTimeMs     Int?
+  playedAt      DateTime  @default(now())
+  @@index([userId])
+  @@index([playedAt])
+}
+
+model UserProfile {
+  id               String   @id @default(cuid())
+  userId           String   @unique
+  user             User     @relation("UserProfile", fields: [userId], references: [id], onDelete: Cascade)
+  displayName      String?
+  bio              String?
+  customAvatarUrl  String?
+  bannerColor      String?  @default("#6366f1")
+  showStats        Boolean  @default(true)
+  showHistory      Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model NotificationPreference {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  user                User     @relation("NotificationPreferences", fields: [userId], references: [id], onDelete: Cascade)
+  pushEnabled         Boolean  @default(false)
+  pushSubscription    String?  // Web Push subscription JSON
+  notifyGameInvite    Boolean  @default(true)
+  notifyGameStart     Boolean  @default(true)
+  notifyNewFollower   Boolean  @default(true)
+  notifyWeeklyReport  Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+// ========================================
+// Phase 3: Gamification
+// ========================================
+
+model Badge {
+  id          String      @id @default(cuid())
+  code        String      @unique  // ex: "first_win", "streak_7", "perfect_game"
+  name        String
+  description String
+  iconUrl     String?
+  category    String      // "achievement", "milestone", "special"
+  rarity      String      @default("common") // "common", "rare", "epic", "legendary"
+  xpReward    Int         @default(0)
+  createdAt   DateTime    @default(now())
+  userBadges  UserBadge[]
+}
+
+model UserBadge {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation("UserBadges", fields: [userId], references: [id], onDelete: Cascade)
+  badgeId   String
+  badge     Badge    @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+  earnedAt  DateTime @default(now())
+  @@unique([userId, badgeId])
+  @@index([userId])
+}
+
+model UserXP {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  user           User     @relation("UserXP", fields: [userId], references: [id], onDelete: Cascade)
+  totalXp        Int      @default(0)
+  level          Int      @default(1)
+  currentLevelXp Int      @default(0)  // XP dans le niveau actuel
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model UserStreak {
+  id              String    @id @default(cuid())
+  userId          String    @unique
+  user            User      @relation("UserStreak", fields: [userId], references: [id], onDelete: Cascade)
+  currentStreak   Int       @default(0)
+  longestStreak   Int       @default(0)
+  lastPlayedAt    DateTime?
+  streakStartedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+model GlobalLeaderboard {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation("GlobalLeaderboard", fields: [userId], references: [id], onDelete: Cascade)
+  period    String   // "all_time", "monthly", "weekly"
+  score     Int      @default(0)
+  wins      Int      @default(0)
+  gamesPlayed Int    @default(0)
+  rank      Int?
+  updatedAt DateTime @updatedAt
+  @@unique([userId, period])
+  @@index([period, score])
+}
+
+// ========================================
+// Phase 5: API Publique
+// ========================================
+
+model ApiKey {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation("ApiKeys", fields: [userId], references: [id], onDelete: Cascade)
+  name          String    // Nom descriptif de la clé
+  keyHash       String    @unique  // Hash SHA-256 de la clé
+  keyPrefix     String    // Préfixe pour identification (ex: "sk_live_abc...")
+  scopes        String    // JSON array des scopes autorisés
+  rateLimit     Int       @default(1000)  // Requêtes par heure
+  requestCount  Int       @default(0)
+  lastResetAt   DateTime  @default(now())
+  lastUsedAt    DateTime?
+  expiresAt     DateTime?
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+  @@index([userId])
+  @@index([keyHash])
+}
+
+model ApiRequestLog {
+  id        String   @id @default(cuid())
+  keyId     String
+  endpoint  String
+  method    String
+  status    Int
+  duration  Int      // ms
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  @@index([keyId])
+  @@index([createdAt])
 }

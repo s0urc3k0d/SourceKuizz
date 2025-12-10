@@ -17,9 +17,13 @@
     "test": "pnpm -r run test"
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
-    "eslint": "^8.57.0",
     "@types/node": "^20.11.0",
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@types/web-push": "^3.6.4",
+    "web-push": "^3.6.7"
   }
 }

@@ -1,13 +1,25 @@
-import { WebSocketGateway, WebSocketServer, SubscribeMessage, MessageBody, ConnectedSocket, OnGatewayConnection, OnGatewayDisconnect } from '@nestjs/websockets';
+import { WebSocketGateway, WebSocketServer, SubscribeMessage, MessageBody, ConnectedSocket, OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
 import { ScoringService } from '../scoring/scoring.service';
 import { PrismaService } from '../database/prisma.service';
 import { JwtService } from '@nestjs/jwt';
-import { UnauthorizedException, Logger } from '@nestjs/common';
+import { UnauthorizedException, Logger, OnModuleDestroy, Inject, forwardRef, Optional } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { RateLimiter } from './rate-limiter';
 import { ClockService } from './clock.service';
 import { MetricsService } from './metrics.service';
+import { GameHistoryService } from '../history/game-history.service';
+import { BadgeService } from '../gamification/badge.service';
+import { XPService, XP_SOURCES } from '../gamification/xp.service';
+import { StreakService } from '../gamification/streak.service';
+import { TwitchBotService } from '../twitch-bot/twitch-bot.service';
+import { 
+  WSJoinSessionSchema, 
+  WSSubmitAnswerSchema, 
+  WSReactionSchema,
+  validatePayload 
+} from './ws-validation';
+import { QUESTION_TYPES, QuestionType } from '../quiz/question-types';
 
 interface SessionPlayer {
   id: string; // socket.id courant
@@ -19,8 +31,12 @@ interface SessionPlayer {
 
 interface SessionQuestion {
   id: string;
+  type: QuestionType;
   timeLimitMs: number;
-  options: { id: string; isCorrect: boolean }[];
+  options: { id: string; isCorrect: boolean; orderIndex?: number | null }[];
+  // Pour text_input
+  correctAnswers?: string[];
+  caseSensitive?: boolean;
 }
 
 interface SessionState {
@@ -48,7 +64,7 @@ function randomCode(len = 6) {
 }
 
 @WebSocketGateway({ cors: { origin: true } })
-export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect, OnModuleDestroy {
   @WebSocketServer() server!: Server;
 
   private sessions = new Map<string, SessionState>();
@@ -59,14 +75,89 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   private answerLatencyBuckets = [0.1,0.25,0.5,0.75,1,2,3,5]; // secondes
   private questionDurationBuckets = [0.25,0.5,0.75,1,1.5,2,3,5,10];
   private sessionDurationBuckets = [1,2,5,10,20,30,60,120,300];
+  private sessionCleanupInterval?: NodeJS.Timeout;
+  private sessionCreationLocks = new Map<string, Promise<void>>(); // Mutex pour création de session
   private getRevealDelayMs() { return parseInt(process.env.REVEAL_DELAY_MS || '2000', 10); }
   private getDetachedTtlMs() { return parseInt(process.env.DETACHED_TTL_MS || '600000', 10); }
+  private getFinishedSessionTtlMs() { return parseInt(process.env.FINISHED_SESSION_TTL_MS || '3600000', 10); } // 1h par défaut
 
-  private emitReject(socket: Socket, event: string, code: string, message?: string, details?: any) {
-    const payload: any = { code };
+  private emitReject(socket: Socket, event: string, code: string, message?: string, details?: Record<string, unknown>) {
+    const payload: { code: string; message?: string; details?: Record<string, unknown> } = { code };
     if (message) payload.message = message;
     if (details) payload.details = details;
     socket.emit(event, payload);
+  }
+
+  /**
+   * Construit le payload session_state de manière centralisée
+   * Évite la duplication de code et assure la cohérence
+   */
+  private buildSessionStatePayload(
+    session: SessionState,
+    options: {
+      code?: string;
+      socketId?: string;
+      isSpectator?: boolean;
+      reconnected?: boolean;
+      remainingMs?: number;
+    } = {}
+  ) {
+    const { code, socketId, isSpectator = false, reconnected = false } = options;
+    let remainingMs = options.remainingMs ?? 0;
+    
+    // Calculer remainingMs si en phase question
+    if (remainingMs === 0 && session.phase === 'question' && session.activeQuestionStartedAt) {
+      const activeQ = session.questions[session.questionIndex];
+      if (activeQ) {
+        const elapsed = this.clock.now() - session.activeQuestionStartedAt;
+        remainingMs = Math.max(0, (activeQ.timeLimitMs || 0) - elapsed);
+      }
+    }
+
+    return {
+      code,
+      status: session.phase || 'lobby',
+      questionIndex: session.questionIndex,
+      remainingMs,
+      totalQuestions: session.questions.length,
+      isHost: socketId ? session.hostId === socketId : false,
+      isSpectator,
+      autoNext: session.autoNext,
+      reconnected: reconnected || undefined,
+      hostId: session.hostId,
+      players: this.buildPlayersList(session),
+      spectators: this.buildSpectatorsList(session),
+      allowSpectatorReactions: !!session.allowSpectatorReactions,
+    };
+  }
+
+  /**
+   * Émet session_state à un socket spécifique
+   */
+  private emitSessionState(socket: Socket, session: SessionState, options: Parameters<typeof this.buildSessionStatePayload>[1] = {}) {
+    socket.emit('session_state', this.buildSessionStatePayload(session, { ...options, socketId: socket.id }));
+  }
+
+  /**
+   * Émet session_state à tous les participants d'une session
+   */
+  private broadcastSessionState(code: string, session: SessionState, remainingMs = 0) {
+    // Émettre à chaque joueur avec son isHost personnalisé
+    for (const [pid] of session.players) {
+      const sock = this.server.sockets.sockets.get(pid);
+      if (sock) {
+        this.emitSessionState(sock, session, { code, remainingMs });
+      }
+    }
+    // Émettre aux spectateurs
+    if (session.viewers) {
+      for (const vid of session.viewers) {
+        const sock = this.server.sockets.sockets.get(vid);
+        if (sock) {
+          this.emitSessionState(sock, session, { code, isSpectator: true, remainingMs });
+        }
+      }
+    }
   }
 
   constructor(
@@ -75,7 +166,58 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     private jwt: JwtService,
     private clock: ClockService,
     private metrics: MetricsService,
-  ) {}
+    @Inject(forwardRef(() => GameHistoryService))
+    private gameHistoryService: GameHistoryService,
+    @Inject(forwardRef(() => BadgeService))
+    private badgeService: BadgeService,
+    @Inject(forwardRef(() => XPService))
+    private xpService: XPService,
+    @Inject(forwardRef(() => StreakService))
+    private streakService: StreakService,
+    @Optional() @Inject(forwardRef(() => TwitchBotService))
+    private twitchBotService?: TwitchBotService,
+  ) {
+    // Nettoyage périodique des sessions terminées pour libérer la mémoire
+    this.sessionCleanupInterval = setInterval(() => this.cleanupFinishedSessions(), 60000);
+    
+    // Configurer les handlers du bot Twitch si disponible
+    if (this.twitchBotService) {
+      this.twitchBotService.setAnswerHandler(this.handleTwitchAnswer.bind(this));
+      this.twitchBotService.setTextAnswerHandler(this.handleTwitchTextAnswer.bind(this));
+    }
+  }
+
+  onModuleDestroy() {
+    // Nettoyage propre à l'arrêt du module
+    if (this.sessionCleanupInterval) {
+      clearInterval(this.sessionCleanupInterval);
+    }
+    // Appeler dispose() pour nettoyer tous les timers et états
+    this.dispose();
+  }
+
+  /** Nettoie les sessions terminées qui sont inactives depuis trop longtemps */
+  private cleanupFinishedSessions() {
+    const now = this.clock.now();
+    const ttl = this.getFinishedSessionTtlMs();
+    let cleaned = 0;
+    
+    for (const [code, session] of this.sessions) {
+      if (session.phase === 'finished' && session.players.size === 0) {
+        const age = now - session.createdAt;
+        if (age > ttl) {
+          if (session.timer) clearTimeout(session.timer);
+          this.sessions.delete(code);
+          this.metrics.dec('sessions.active');
+          cleaned++;
+        }
+      }
+    }
+    
+    if (cleaned > 0) {
+      this.logger.log(`Cleaned up ${cleaned} finished sessions`);
+    }
+  }
 
   async handleConnection(socket: Socket) {
     try {
@@ -137,7 +279,14 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
 
   /** Join session (creates ephemeral session with quiz questions loaded) */
   @SubscribeMessage('join_session')
-  async handleJoin(@MessageBody() data: { code?: string; quizId: string; nickname?: string; spectator?: boolean }, @ConnectedSocket() socket: Socket) {
+  async handleJoin(@MessageBody() rawData: unknown, @ConnectedSocket() socket: Socket) {
+    // Validation Zod du payload
+    const validation = validatePayload(WSJoinSessionSchema, rawData);
+    if (!validation.success) {
+      this.emitReject(socket, 'join_rejected', 'invalid_payload', validation.error);
+      return;
+    }
+    const data = validation.data;
     let { code, quizId } = data;
     if (!code) {
       // Générer code session alphanum 6 chars non collision
@@ -171,7 +320,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     detached: new Map(),
         viewers: new Set(),
         questionIndex: 0,
-        questions: questions.map(q => ({ id: q.id, timeLimitMs: q.timeLimitMs, options: q.options })),
+        questions: questions.map((q: any) => ({
+          id: q.id,
+          type: (q.type || 'multiple_choice') as QuestionType,
+          timeLimitMs: q.timeLimitMs,
+          options: q.options.map((o: any) => ({ 
+            id: o.id, 
+            isCorrect: o.isCorrect,
+            orderIndex: o.orderIndex ?? null 
+          })),
+          correctAnswers: q.correctAnswers ? JSON.parse(q.correctAnswers) : undefined,
+          caseSensitive: q.caseSensitive ?? false,
+        })),
         answers: new Map(),
         phase: 'lobby',
         autoNext: false,
@@ -366,6 +526,10 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         const sessionDur = this.clock.now() - session.createdAt;
         this.metrics.observe('session.duration_seconds', sessionDur/1000, this.sessionDurationBuckets);
       }
+      // Enregistrer l'historique des joueurs authentifiés
+      this.recordGameHistory(code, session).catch(err => {
+        this.logger.error('Failed to record game history', err);
+      });
       // Clear detached à la fin
       if (session.detached) session.detached.clear();
       this.server.to(code).emit('session_finished', { final: this.buildLeaderboardEntries(session) });
@@ -385,6 +549,149 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
+  /**
+   * Enregistre l'historique de jeu pour tous les joueurs authentifiés
+   * et met à jour les stats de gamification (XP, badges, streaks)
+   */
+  private async recordGameHistory(code: string, session: SessionState) {
+    // Récupérer les infos du quiz depuis la DB
+    const dbSession = await this.prisma.gameSession.findUnique({
+      where: { code },
+      include: { quiz: { select: { id: true, title: true } } },
+    });
+    
+    if (!dbSession) return;
+
+    const leaderboard = this.buildLeaderboardEntries(session);
+    const totalPlayers = leaderboard.length;
+    const totalQuestions = session.questions.length;
+
+    // Récupérer les réponses des joueurs pour calculer les stats
+    const playerAnswers = await this.prisma.playerAnswer.findMany({
+      where: {
+        player: {
+          session: { code },
+        },
+      },
+      include: {
+        player: true,
+      },
+    });
+
+    // Grouper par playerId
+    const answersByPlayer = new Map<string, typeof playerAnswers>();
+    for (const answer of playerAnswers) {
+      const arr = answersByPlayer.get(answer.playerId) || [];
+      arr.push(answer);
+      answersByPlayer.set(answer.playerId, arr);
+    }
+
+    // Pour chaque joueur authentifié, enregistrer dans l'historique et mettre à jour la gamification
+    for (const entry of leaderboard) {
+      const player = Array.from(session.players.values()).find(p => p.nickname === entry.nickname);
+      if (!player?.userId) continue; // Skip joueurs non authentifiés
+
+      const playerDbRecord = await this.prisma.gamePlayer.findFirst({
+        where: { sessionId: dbSession.id, nickname: player.nickname },
+      });
+
+      const answers = playerDbRecord ? answersByPlayer.get(playerDbRecord.id) || [] : [];
+      const correctCount = answers.filter(a => a.correct).length;
+      const correctTimes = answers.filter(a => a.correct && a.timeMs > 0).map(a => a.timeMs);
+      const avgTimeMs = correctTimes.length > 0
+        ? Math.round(correctTimes.reduce((a, b) => a + b, 0) / correctTimes.length)
+        : undefined;
+
+      // Enregistrer l'historique de jeu
+      await this.gameHistoryService.recordGame({
+        userId: player.userId,
+        sessionCode: code,
+        quizId: dbSession.quiz.id,
+        quizTitle: dbSession.quiz.title,
+        score: entry.score,
+        rank: entry.rank,
+        totalPlayers,
+        correctCount,
+        totalQuestions,
+        avgTimeMs,
+      });
+
+      // === GAMIFICATION ===
+      try {
+        // 1. Calculer et attribuer l'XP
+        let totalXp = XP_SOURCES.GAME_COMPLETE; // 25 XP pour avoir terminé
+
+        // XP pour les bonnes réponses
+        totalXp += correctCount * XP_SOURCES.CORRECT_ANSWER; // 10 XP par bonne réponse
+
+        // XP bonus selon le classement
+        if (entry.rank === 1 && totalPlayers > 1) {
+          totalXp += XP_SOURCES.GAME_WIN; // 100 XP pour la victoire
+          totalXp += XP_SOURCES.FIRST_PLACE; // 75 XP pour la 1ère place
+        } else if (entry.rank === 2 && totalPlayers > 2) {
+          totalXp += XP_SOURCES.SECOND_PLACE; // 50 XP pour la 2ème place
+        } else if (entry.rank === 3 && totalPlayers > 3) {
+          totalXp += XP_SOURCES.THIRD_PLACE; // 25 XP pour la 3ème place
+        }
+
+        // Partie parfaite ?
+        if (correctCount === totalQuestions && totalQuestions > 0) {
+          totalXp += XP_SOURCES.PERFECT_GAME; // 50 XP bonus
+        }
+
+        // Bonus de streak (séries de bonnes réponses)
+        const maxStreak = this.calculateMaxAnswerStreak(answers);
+        if (maxStreak >= 3) {
+          totalXp += XP_SOURCES.STREAK_BONUS * Math.floor(maxStreak / 3); // 5 XP par série de 3
+        }
+
+        await this.xpService.addXP(player.userId, totalXp, 'game_complete');
+
+        // 2. Mettre à jour le streak journalier
+        await this.streakService.updateStreak(player.userId);
+
+        // 3. Vérifier et attribuer les badges de jeu
+        const isWin = entry.rank === 1 && totalPlayers > 1;
+        const correctRate = totalQuestions > 0 ? correctCount / totalQuestions : 0;
+        const fastestAnswerMs = answers.filter(a => a.correct).reduce((min, a) => Math.min(min, a.timeMs || Infinity), Infinity);
+        
+        await this.badgeService.checkAndAwardBadges(player.userId, {
+          rank: entry.rank,
+          totalPlayers,
+          correctRate,
+          isWin,
+          fastestAnswerMs: fastestAnswerMs !== Infinity ? fastestAnswerMs : undefined,
+        });
+
+        // 4. Vérifier les badges de streak
+        await this.badgeService.checkStreakBadges(player.userId);
+
+        this.logger.debug(`Gamification updated for user ${player.userId}: +${totalXp} XP`);
+      } catch (err) {
+        this.logger.error(`Failed to update gamification for user ${player.userId}`, err);
+      }
+    }
+
+    this.logger.log(`Recorded game history for session ${code}`);
+  }
+
+  /**
+   * Calcule la plus longue série de bonnes réponses consécutives
+   */
+  private calculateMaxAnswerStreak(answers: Array<{ correct: boolean }>): number {
+    let maxStreak = 0;
+    let currentStreak = 0;
+    for (const answer of answers) {
+      if (answer.correct) {
+        currentStreak++;
+        maxStreak = Math.max(maxStreak, currentStreak);
+      } else {
+        currentStreak = 0;
+      }
+    }
+    return maxStreak;
+  }
+
   private startQuestionInternal(code: string, session: SessionState) {
     const q = session.questions[session.questionIndex];
     if (!q) return;
@@ -398,7 +705,14 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
 
   @SubscribeMessage('submit_answer')
   async handleAnswer(
-    @MessageBody() data: { questionId: string; optionId: string; clientTs: number; code?: string },
+    @MessageBody() data: { 
+      questionId: string; 
+      optionId?: string; 
+      textAnswer?: string;
+      orderedOptionIds?: string[];
+      clientTs: number; 
+      code?: string 
+    },
     @ConnectedSocket() socket: Socket,
   ) {
   const code = data.code || this.findSessionForSocket(socket.id);
@@ -428,28 +742,41 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       socket.emit('answer_ack', { questionId: data.questionId, accepted: false, reason: 'unknown_question' });
       return;
     }
-    const option = currentQuestion.options.find(o => o.id === data.optionId);
-    if (!option) {
-      socket.emit('answer_ack', { questionId: data.questionId, accepted: false, reason: 'unknown_option' });
-      return;
-    }
-  const now = this.clock.now();
-    const startedAt = session.activeQuestionStartedAt ?? now; // fallback si pas initialisé
+
+    const now = this.clock.now();
+    const startedAt = session.activeQuestionStartedAt ?? now;
     const elapsed = now - startedAt;
-    const correct = option.isCorrect;
+
+    // Vérifier la réponse selon le type de question
+    const { correct, partialScore } = this.checkAnswerByType(currentQuestion, data);
+
     if (correct) player.streak += 1; else player.streak = 0;
-    const scoreDelta = this.scoring.computeScore({
+    
+    // Calculer le score (avec bonus partiel pour ordering)
+    let scoreDelta = this.scoring.computeScore({
       correct,
       timeMs: elapsed,
       limitMs: currentQuestion.timeLimitMs || 5000,
       streak: player.streak,
     });
+
+    // Bonus de score partiel pour les questions d'ordre
+    if (partialScore !== undefined && partialScore > 0 && !correct) {
+      scoreDelta = Math.floor(scoreDelta * partialScore * 0.5); // 50% du score max × score partiel
+    }
+
     player.score += scoreDelta;
-    socket.emit('answer_ack', { questionId: data.questionId, accepted: true, correct, scoreDelta });
+    socket.emit('answer_ack', { 
+      questionId: data.questionId, 
+      accepted: true, 
+      correct, 
+      scoreDelta,
+      partialScore 
+    });
   this.broadcastLeaderboard(code);
   this.metrics.inc('answer.received');
   this.metrics.observe('answer.latency_seconds', elapsed/1000, this.answerLatencyBuckets);
-    // Émettre un session_state de progression (score side-effect côté clients potentiels) sans remainingMs recalcul si lobby/reveal
+    // Émettre un session_state de progression
     let rem = 0;
     if (session.phase === 'question' && session.activeQuestionStartedAt) {
       const now2 = this.clock.now();
@@ -466,8 +793,23 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
           const paUnique = `${gamePlayer.id}:${currentQuestion.id}`;
             await (this.prisma.playerAnswer as any).upsert({
               where: { uniqueKey: paUnique },
-              update: { optionId: option.id, correct, timeMs: elapsed },
-              create: { playerId: gamePlayer.id, questionId: currentQuestion.id, optionId: option.id, correct, timeMs: elapsed, uniqueKey: paUnique },
+              update: { 
+                optionId: data.optionId || null, 
+                textAnswer: data.textAnswer || null,
+                orderingAnswer: data.orderedOptionIds ? JSON.stringify(data.orderedOptionIds) : null,
+                correct, 
+                timeMs: elapsed 
+              },
+              create: { 
+                playerId: gamePlayer.id, 
+                questionId: currentQuestion.id, 
+                optionId: data.optionId || null, 
+                textAnswer: data.textAnswer || null,
+                orderingAnswer: data.orderedOptionIds ? JSON.stringify(data.orderedOptionIds) : null,
+                correct, 
+                timeMs: elapsed, 
+                uniqueKey: paUnique 
+              },
             });
             await (this.prisma.gamePlayer as any).update({ where: { id: gamePlayer.id }, data: { score: player.score } });
         }
@@ -475,12 +817,70 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     } catch (e) {
       this.logger.warn(`Persist answer failed: ${e}`);
     }
-    // Auto reveal if everyone answered or all players responded
+    // Auto reveal if everyone answered
     const q = session.questions[session.questionIndex];
     const answeredCount = session.answers.get(q.id)?.size || 0;
     if (answeredCount >= session.players.size) {
       this.metrics.inc('question.autoreveal');
       this.forceReveal(code);
+    }
+  }
+
+  /**
+   * Vérifie une réponse selon le type de question
+   */
+  private checkAnswerByType(
+    question: SessionQuestion,
+    answer: { optionId?: string; textAnswer?: string; orderedOptionIds?: string[] }
+  ): { correct: boolean; partialScore?: number } {
+    switch (question.type) {
+      case QUESTION_TYPES.MULTIPLE_CHOICE:
+      case QUESTION_TYPES.TRUE_FALSE:
+        if (!answer.optionId) return { correct: false };
+        const option = question.options.find(o => o.id === answer.optionId);
+        return { correct: option?.isCorrect ?? false };
+
+      case QUESTION_TYPES.TEXT_INPUT:
+        if (!answer.textAnswer || !question.correctAnswers) return { correct: false };
+        const normalize = (s: string) => {
+          let n = s.trim();
+          if (!question.caseSensitive) n = n.toLowerCase();
+          return n;
+        };
+        const normalizedAnswer = normalize(answer.textAnswer);
+        const isCorrect = question.correctAnswers.some(ca => normalize(ca) === normalizedAnswer);
+        return { correct: isCorrect };
+
+      case QUESTION_TYPES.ORDERING:
+        if (!answer.orderedOptionIds || answer.orderedOptionIds.length === 0) {
+          return { correct: false, partialScore: 0 };
+        }
+        const sortedOptions = [...question.options]
+          .filter(o => o.orderIndex !== undefined && o.orderIndex !== null)
+          .sort((a, b) => (a.orderIndex ?? 0) - (b.orderIndex ?? 0));
+        const correctOrder = sortedOptions.map(o => o.id);
+        
+        const isFullyCorrect =
+          answer.orderedOptionIds.length === correctOrder.length &&
+          answer.orderedOptionIds.every((id, idx) => id === correctOrder[idx]);
+
+        let correctPositions = 0;
+        for (let i = 0; i < Math.min(answer.orderedOptionIds.length, correctOrder.length); i++) {
+          if (answer.orderedOptionIds[i] === correctOrder[i]) {
+            correctPositions++;
+          }
+        }
+        const partialScore = correctOrder.length > 0 ? correctPositions / correctOrder.length : 0;
+        
+        return { correct: isFullyCorrect, partialScore };
+
+      default:
+        // Fallback pour les anciens types
+        if (answer.optionId) {
+          const opt = question.options.find(o => o.id === answer.optionId);
+          return { correct: opt?.isCorrect ?? false };
+        }
+        return { correct: false };
     }
   }
 
@@ -610,10 +1010,11 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     try {
       await this.prisma.gameSession.create({ data: { code, quizId } });
       return;
-    } catch (e: any) {
-      // Conflit unique -> récupérer
-      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
-        return; // déjà existante
+    } catch (e: unknown) {
+      // Conflit unique -> recuperer
+      const prismaError = e as { code?: string };
+      if (prismaError?.code === 'P2002') {
+        return; // deja existante
       }
       // Toute autre erreur : on re-tente findUnique pour log utile
       const existing = await this.prisma.gameSession.findUnique({ where: { code } });
@@ -631,8 +1032,12 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       while (this.sessions.has(c) || await this.prisma.gameSession.findUnique({ where: { code: c } })) {
         c = randomCode();
       }
-      // Charger questions minimalistes
-      const questions = await this.prisma.question.findMany({ where: { quizId }, orderBy: { order: 'asc' }, include: { options: { select: { id: true, isCorrect: true } } } });
+      // Charger questions avec tous les champs nécessaires
+      const questions = await this.prisma.question.findMany({ 
+        where: { quizId }, 
+        orderBy: { order: 'asc' }, 
+        include: { options: { select: { id: true, isCorrect: true, orderIndex: true } } } 
+      });
       await this.createOrGetSession(c, quizId);
       // Lire flag persistant
       let allowSpectator = true;
@@ -647,7 +1052,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         players: new Map(),
         detached: new Map(),
         questionIndex: 0,
-        questions: questions.map(q => ({ id: q.id, timeLimitMs: q.timeLimitMs, options: q.options })),
+        questions: questions.map((q: any) => ({
+          id: q.id,
+          type: (q.type || 'multiple_choice') as QuestionType,
+          timeLimitMs: q.timeLimitMs,
+          options: q.options.map((o: any) => ({ 
+            id: o.id, 
+            isCorrect: o.isCorrect,
+            orderIndex: o.orderIndex ?? null 
+          })),
+          correctAnswers: q.correctAnswers ? JSON.parse(q.correctAnswers) : undefined,
+          caseSensitive: q.caseSensitive ?? false,
+        })),
         answers: new Map(),
         phase: 'lobby',
         autoNext: false,
@@ -695,16 +1111,217 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.limiter.clear();
   }
 
-  // Support hook Nest (si jamais enregistré via OnModuleDestroy dans le futur)
-  async onModuleDestroy() {
-    this.dispose();
-  }
-
   private cleanupDetached(s: SessionState) {
     if (!s.detached || s.detached.size === 0) return;
     const now = this.clock.now();
     for (const [uid, snap] of [...s.detached.entries()]) {
       if (snap.expiresAt <= now) s.detached.delete(uid);
+    }
+  }
+
+  // ========================================
+  // Twitch Bot Integration
+  // ========================================
+
+  /**
+   * Handler pour les réponses venant du chat Twitch
+   */
+  private async handleTwitchAnswer(sessionCode: string, playerId: string, optionId: string) {
+    const session = this.sessions.get(sessionCode);
+    if (!session || session.phase !== 'question') return;
+
+    const question = session.questions[session.questionIndex];
+    if (!question) return;
+
+    // Vérifier si le joueur a déjà répondu
+    const answered = session.answers.get(question.id);
+    if (answered?.has(playerId)) return;
+
+    // Marquer comme répondu
+    if (!answered) {
+      session.answers.set(question.id, new Set([playerId]));
+    } else {
+      answered.add(playerId);
+    }
+
+    // Calculer le temps de réponse
+    const elapsed = session.activeQuestionStartedAt
+      ? this.clock.now() - session.activeQuestionStartedAt
+      : question.timeLimitMs;
+
+    // Vérifier si la réponse est correcte
+    const opt = question.options.find(o => o.id === optionId);
+    const isCorrect = opt?.isCorrect ?? false;
+
+    // Calculer les points
+    const points = this.scoring.computeScore({
+      correct: isCorrect,
+      timeMs: elapsed,
+      limitMs: question.timeLimitMs,
+      streak: 0,
+    });
+
+    // Récupérer le joueur depuis la DB
+    const dbPlayer = await this.prisma.gamePlayer.findUnique({
+      where: { id: playerId },
+    });
+
+    if (!dbPlayer) return;
+
+    // Mettre à jour le score
+    if (points > 0) {
+      await this.prisma.gamePlayer.update({
+        where: { id: playerId },
+        data: { score: { increment: points } },
+      });
+    }
+
+    // Enregistrer la réponse
+    const answerKey = `${playerId}:${question.id}`;
+    await this.prisma.playerAnswer.upsert({
+      where: { uniqueKey: answerKey },
+      create: {
+        player: { connect: { id: playerId } },
+        question: { connect: { id: question.id } },
+        option: { connect: { id: optionId } },
+        correct: isCorrect,
+        timeMs: elapsed,
+        uniqueKey: answerKey,
+      },
+      update: {},
+    });
+
+    // Émettre le résultat à la room
+    this.server.to(sessionCode).emit('answer_result', {
+      playerId,
+      nickname: dbPlayer.nickname,
+      correct: isCorrect,
+      points,
+    });
+
+    this.logger.debug(`Twitch answer from ${dbPlayer.nickname}: ${isCorrect ? 'correct' : 'incorrect'} (+${points})`);
+  }
+
+  /**
+   * Handler pour les réponses texte venant du chat Twitch
+   */
+  private async handleTwitchTextAnswer(sessionCode: string, playerId: string, textAnswer: string) {
+    const session = this.sessions.get(sessionCode);
+    if (!session || session.phase !== 'question') return;
+
+    const question = session.questions[session.questionIndex];
+    if (!question || question.type !== 'text_input') return;
+
+    // Vérifier si le joueur a déjà répondu
+    const answered = session.answers.get(question.id);
+    if (answered?.has(playerId)) return;
+
+    // Marquer comme répondu
+    if (!answered) {
+      session.answers.set(question.id, new Set([playerId]));
+    } else {
+      answered.add(playerId);
+    }
+
+    // Calculer le temps de réponse
+    const elapsed = session.activeQuestionStartedAt
+      ? this.clock.now() - session.activeQuestionStartedAt
+      : question.timeLimitMs;
+
+    // Vérifier la réponse
+    const correctAnswers = question.correctAnswers || [];
+    const caseSensitive = question.caseSensitive ?? false;
+    
+    const normalizedAnswer = caseSensitive ? textAnswer.trim() : textAnswer.trim().toLowerCase();
+    const isCorrect = correctAnswers.some(ca => {
+      const normalizedCorrect = caseSensitive ? ca.trim() : ca.trim().toLowerCase();
+      return normalizedAnswer === normalizedCorrect;
+    });
+
+    // Calculer les points
+    const points = this.scoring.computeScore({
+      correct: isCorrect,
+      timeMs: elapsed,
+      limitMs: question.timeLimitMs,
+      streak: 0,
+    });
+
+    // Récupérer le joueur
+    const dbPlayer = await this.prisma.gamePlayer.findUnique({
+      where: { id: playerId },
+    });
+
+    if (!dbPlayer) return;
+
+    // Mettre à jour le score
+    if (points > 0) {
+      await this.prisma.gamePlayer.update({
+        where: { id: playerId },
+        data: { score: { increment: points } },
+      });
+    }
+
+    // Enregistrer la réponse
+    const answerKey = `${playerId}:${question.id}`;
+    await this.prisma.playerAnswer.upsert({
+      where: { uniqueKey: answerKey },
+      create: {
+        player: { connect: { id: playerId } },
+        question: { connect: { id: question.id } },
+        textAnswer,
+        correct: isCorrect,
+        timeMs: elapsed,
+        uniqueKey: answerKey,
+      },
+      update: {},
+    });
+
+    // Émettre le résultat
+    this.server.to(sessionCode).emit('answer_result', {
+      playerId,
+      nickname: dbPlayer.nickname,
+      correct: isCorrect,
+      points,
+    });
+  }
+
+  /**
+   * Notifier le bot Twitch d'une nouvelle question
+   */
+  public notifyTwitchQuestion(
+    sessionCode: string,
+    questionIndex: number,
+    prompt: string,
+    options: Array<{ id: string; label: string }>,
+    timeLimitMs: number,
+  ) {
+    if (this.twitchBotService?.isSessionActive(sessionCode)) {
+      this.twitchBotService.sendQuestion(sessionCode, questionIndex, prompt, options, timeLimitMs);
+    }
+  }
+
+  /**
+   * Notifier le bot Twitch de la fin d'une question
+   */
+  public notifyTwitchQuestionEnd(
+    sessionCode: string,
+    correctOptionLabel: string,
+    topAnswers: Array<{ nickname: string; points: number }>,
+  ) {
+    if (this.twitchBotService?.isSessionActive(sessionCode)) {
+      this.twitchBotService.endQuestion(sessionCode, correctOptionLabel, topAnswers);
+    }
+  }
+
+  /**
+   * Notifier le bot Twitch du classement final
+   */
+  public notifyTwitchFinalLeaderboard(
+    sessionCode: string,
+    leaderboard: Array<{ nickname: string; score: number }>,
+  ) {
+    if (this.twitchBotService?.isSessionActive(sessionCode)) {
+      this.twitchBotService.sendFinalLeaderboard(sessionCode, leaderboard);
     }
   }
 }

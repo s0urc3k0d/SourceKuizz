@@ -3,6 +3,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { apiFetch } from '../../src/lib/api';
 import { useUIStore } from '../../src/store/ui';
 import { useAuthStore } from '../../src/store/auth';
+import ShareButtons from '../../src/components/ShareButtons';
+import Header from '../../src/components/Header';
 
 type Summary = {
   code: string;
@@ -22,6 +24,7 @@ export default function SessionSummaryPage() {
   const [error, setError] = useState<string | null>(null);
   const addToast = useUIStore(s => s.addToast);
   const access = useAuthStore(s => s.accessToken);
+  const username = useAuthStore(s => s.username);
 
   useEffect(() => {
     if (!code) return;
@@ -45,10 +48,11 @@ export default function SessionSummaryPage() {
   const exportHref = useMemo(() => code ? `/api/sessions/${code}/export.csv` : '#', [code]);
   const summaryHref = useMemo(() => code ? `${typeof window!== 'undefined' ? window.location.origin : ''}/summary/${code}` : '', [code]);
 
-  function copy(text: string) {
-    try { navigator.clipboard.writeText(text); addToast({ type: 'success', message: 'Lien copié' }); }
-    catch { addToast({ type: 'error', message: 'Copie échouée' }); }
-  }
+  // Trouver mon score et rang si connecté
+  const myResult = useMemo(() => {
+    if (!username || !summary) return null;
+    return summary.leaderboard.find(e => e.nickname.toLowerCase() === username.toLowerCase());
+  }, [username, summary]);
 
   async function replayQuiz() {
     if (!summary?.quiz?.id) { addToast({ type: 'warning', message: 'Quiz inconnu' }); return; }
@@ -66,17 +70,48 @@ export default function SessionSummaryPage() {
   }
 
   return (
-    <main style={{ padding: 24, display: 'grid', gap: 16 }}>
-      <h1>Résumé de la session {code}</h1>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <button onClick={() => router.push('/')}>Accueil</button>
-        {code && <a href={exportHref} target="_blank" rel="noreferrer"><button>Exporter CSV</button></a>}
-        {code && <button onClick={() => copy(summaryHref)}>Copier lien du résumé</button>}
-        {access && summary?.quiz?.id && <button onClick={replayQuiz}>Rejouer ce quiz</button>}
-      </div>
-      {loading && <div>Chargement…</div>}
-      {error && <div style={{ color: '#a00' }}>{error}</div>}
-      {summary && (
+    <>
+      <Header />
+      <main className="max-w-4xl mx-auto p-6 space-y-6">
+        <h1 className="text-2xl font-bold text-gray-900">🏆 Résumé de la session {code}</h1>
+        
+        <div className="flex flex-wrap gap-3">
+          <button 
+            onClick={() => router.push('/')}
+            className="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg transition"
+          >
+            Accueil
+          </button>
+          {code && (
+            <a href={exportHref} target="_blank" rel="noreferrer">
+              <button className="px-4 py-2 bg-green-100 hover:bg-green-200 text-green-700 rounded-lg transition">
+                📥 Exporter CSV
+              </button>
+            </a>
+          )}
+          {access && summary?.quiz?.id && (
+            <button 
+              onClick={replayQuiz}
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
+            >
+              🔄 Rejouer ce quiz
+            </button>
+          )}
+        </div>
+
+        {loading && (
+          <div className="flex items-center justify-center py-12">
+            <div className="animate-spin w-8 h-8 border-4 border-indigo-600 border-t-transparent rounded-full" />
+          </div>
+        )}
+        
+        {error && (
+          <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+            {error}
+          </div>
+        )}
+        
+        {summary && (
         <div style={{ display: 'grid', gap: 16 }}>
           <section style={{ display: 'grid', gap: 6 }}>
             <div><b>Quiz:</b> {summary.quiz.title} <small style={{ color: '#666' }}>({summary.quiz.id})</small></div>
@@ -136,8 +171,20 @@ export default function SessionSummaryPage() {
               </ul>
             )}
           </section>
+
+          {/* Partage social */}
+          <section className="bg-white rounded-xl shadow p-6">
+            <ShareButtons
+              title={`Quiz ${summary.quiz.title} sur SourceKuizz`}
+              text={`Je viens de jouer au quiz "${summary.quiz.title}" sur SourceKuizz !`}
+              url={summaryHref}
+              score={myResult?.score}
+              rank={myResult?.rank}
+            />
+          </section>
         </div>
       )}
     </main>
+    </>
   );
 }

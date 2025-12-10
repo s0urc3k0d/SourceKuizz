@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
 import { UsersService } from '../users/users.service';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../database/prisma.service';
@@ -15,7 +15,7 @@ export class AuthService {
 
   async register(username: string, password: string) {
     const existing = await this.users.findByUsername(username);
-    if (existing) throw new (require('@nestjs/common').ConflictException)('username_taken');
+    if (existing) throw new ConflictException('username_taken');
     const user = await this.users.createLocalUser(username, password);
     return this.issueTokens(user.id, username);
   }
@@ -41,14 +41,50 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string) {
-    const sessions = await this.prisma.authSession.findMany({ where: { expiresAt: { gt: new Date() } } });
+    // Optimisation: on limite le nombre de sessions à vérifier et on utilise un index
+    const sessions = await this.prisma.authSession.findMany({ 
+      where: { expiresAt: { gt: new Date() } },
+      take: 100, // Limite pour éviter les problèmes de performance
+      orderBy: { createdAt: 'desc' },
+    });
     for (const s of sessions) {
       if (await argon2.verify(s.refreshTokenHash, refreshToken)) {
         const user = await this.prisma.user.findUnique({ where: { id: s.userId } });
         if (!user) break;
+        // Rotation du token: invalider l'ancien et créer un nouveau
+        await this.prisma.authSession.delete({ where: { id: s.id } });
         return this.issueTokens(user.id, user.username);
       }
     }
     throw new UnauthorizedException('invalid_refresh');
+  }
+
+  async logout(refreshToken: string) {
+    // Supprimer la session correspondante
+    const sessions = await this.prisma.authSession.findMany({ 
+      where: { expiresAt: { gt: new Date() } },
+      take: 100,
+    });
+    for (const s of sessions) {
+      if (await argon2.verify(s.refreshTokenHash, refreshToken)) {
+        await this.prisma.authSession.delete({ where: { id: s.id } });
+        return { success: true };
+      }
+    }
+    // On ne révèle pas si le token était valide ou non
+    return { success: true };
+  }
+
+  async revokeAllSessions(userId: string) {
+    await this.prisma.authSession.deleteMany({ where: { userId } });
+    return { success: true };
+  }
+
+  // Nettoyage périodique des sessions expirées (à appeler via un cron job)
+  async cleanupExpiredSessions() {
+    const result = await this.prisma.authSession.deleteMany({
+      where: { expiresAt: { lt: new Date() } },
+    });
+    return { deleted: result.count };
   }
 }

@@ -6,6 +6,8 @@ type AuthState = {
   accessToken?: string;
   refreshToken?: string;
   user?: User;
+  userId?: string;
+  username?: string;
   setTokens: (access: string, refresh?: string) => void;
   clear: () => void;
   bootstrap: () => void;
@@ -24,10 +26,19 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   accessToken: undefined,
   refreshToken: undefined,
   user: undefined,
+  userId: undefined,
+  username: undefined,
   setTokens: (access, refresh) => {
     const payload = decodeJwt(access);
     const username = payload?.username as string | undefined;
-    set({ accessToken: access, refreshToken: refresh ?? get().refreshToken, user: username ? { username } : undefined });
+    const userId = payload?.sub as string | undefined;
+    set({ 
+      accessToken: access, 
+      refreshToken: refresh ?? get().refreshToken, 
+      user: username ? { id: userId, username } : undefined,
+      userId,
+      username,
+    });
     try {
       localStorage.setItem('accessToken', access);
       if (refresh) localStorage.setItem('refreshToken', refresh);
@@ -36,7 +47,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     } catch {}
   },
   clear: () => {
-    set({ accessToken: undefined, refreshToken: undefined, user: undefined });
+    set({ accessToken: undefined, refreshToken: undefined, user: undefined, userId: undefined, username: undefined });
     try {
       localStorage.removeItem('accessToken');
       localStorage.removeItem('refreshToken');
@@ -51,7 +62,14 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       if (access) {
         const payload = decodeJwt(access);
         const username = payload?.username as string | undefined;
-        set({ accessToken: access, refreshToken: refresh, user: username ? { username } : undefined });
+        const userId = payload?.sub as string | undefined;
+        set({ 
+          accessToken: access, 
+          refreshToken: refresh, 
+          user: username ? { id: userId, username } : undefined,
+          userId,
+          username,
+        });
       }
     } catch {}
   },

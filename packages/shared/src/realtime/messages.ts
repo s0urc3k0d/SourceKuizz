@@ -2,7 +2,7 @@
 
 export type WSJoinSession = {
   code?: string;
-  quizId: string;
+  quizId?: string;
   nickname?: string;
   spectator?: boolean;
 };

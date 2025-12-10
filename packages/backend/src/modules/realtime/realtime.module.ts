@@ -1,4 +1,4 @@
-import { Module, OnModuleInit, Injectable } from '@nestjs/common';
+import { Module, OnModuleInit, Injectable, forwardRef } from '@nestjs/common';
 import { RealtimeGateway } from './realtime.gateway';
 import { ScoringModule } from '../scoring/scoring.module';
 import { DatabaseModule } from '../database/database.module';
@@ -6,6 +6,9 @@ import { ClockService } from './clock.service';
 import { MetricsService } from './metrics.service';
 import { LeaderboardController } from './leaderboard.controller';
 import { SessionController } from './session.controller';
+import { GameHistoryModule } from '../history/game-history.module';
+import { GamificationModule } from '../gamification/gamification.module';
+import { TwitchBotModule } from '../twitch-bot/twitch-bot.module';
 
 @Injectable()
 class RealtimeMetricsGaugesInitializer implements OnModuleInit {
@@ -22,7 +25,13 @@ class RealtimeMetricsGaugesInitializer implements OnModuleInit {
 }
 
 @Module({
-  imports: [ScoringModule, DatabaseModule],
+  imports: [
+    ScoringModule,
+    DatabaseModule,
+    forwardRef(() => GameHistoryModule),
+    forwardRef(() => GamificationModule),
+    forwardRef(() => TwitchBotModule),
+  ],
   providers: [RealtimeGateway, ClockService, MetricsService, RealtimeMetricsGaugesInitializer],
   exports: [MetricsService],
   controllers: [LeaderboardController, SessionController],
