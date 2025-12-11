@@ -65,120 +65,130 @@ export default function OverlayPage() {
     if (!code) return;
 
     const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'http://localhost:3001';
-    const socket = io(wsUrl, {
-      transports: ['websocket'],
-      reconnection: true,
-      reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-    });
+    
+    // D'abord récupérer le quizId depuis l'API
+    fetch(`/api/sessions/${code}/info`)
+      .then(res => {
+        if (!res.ok) throw new Error('Session not found');
+        return res.json();
+      })
+      .then(data => {
+        if (!data.quizId) {
+          console.error('No quizId in session info');
+          return;
+        }
+        
+        // Maintenant connecter le socket avec le quizId
+        const socket = io(wsUrl, {
+          transports: ['websocket'],
+          reconnection: true,
+          reconnectionAttempts: Infinity,
+          reconnectionDelay: 1000,
+        });
 
-    socketRef.current = socket;
+        socketRef.current = socket;
 
-    socket.on('connect', () => {
-      setConnected(true);
-      // Rejoindre en tant que spectateur via join_session
-      // On doit d'abord récupérer le quizId depuis l'API
-      fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/sessions/${code}/info`)
-        .then(res => res.json())
-        .then(data => {
-          if (data.quizId) {
-            socket.emit('join_session', { code, quizId: data.quizId, spectator: true });
+        socket.on('connect', () => {
+          console.log('[Overlay] Connected, joining session...');
+          setConnected(true);
+          socket.emit('join_session', { code, quizId: data.quizId, spectator: true });
+        });
+
+        socket.on('disconnect', () => {
+          console.log('[Overlay] Disconnected');
+          setConnected(false);
+        });
+
+        socket.on('error_generic', (err: any) => {
+          console.error('[Overlay] Error:', err);
+        });
+
+        socket.on('join_rejected', (err: any) => {
+          console.error('[Overlay] Join rejected:', err);
+        });
+
+        // Session state update
+        socket.on('session_state', (data: any) => {
+          console.log('[Overlay] session_state:', data);
+          // Filtrer l'hôte de la liste des joueurs
+          const filteredPlayers = (data.players || []).filter((p: any) => p.id !== data.hostId);
+          setPlayers(filteredPlayers);
+          setSessionStatus(data.status === 'question' || data.status === 'reveal' ? 'playing' : data.status);
+          setQuestionIndex(data.questionIndex || 0);
+          setTotalQuestions(data.totalQuestions || 0);
+        });
+
+        // Player joined
+        socket.on('player_joined', (data: any) => {
+          setPlayers(prev => {
+            if (prev.find(p => p.id === data.playerId)) return prev;
+            return [...prev, { id: data.playerId, nickname: data.nickname, score: 0 }];
+          });
+        });
+
+        // Player left
+        socket.on('player_left', (data: any) => {
+          setPlayers(prev => prev.filter(p => p.id !== data.playerId));
+        });
+
+        // New question (question_started from backend)
+        socket.on('question_started', (data: any) => {
+          console.log('[Overlay] question_started:', data);
+          setShowResults(false);
+          setCorrectOptionId(null);
+          setLastAnswers([]);
+          setAnimateQuestion(true);
+          setSessionStatus('playing');
+          
+          setQuestionIndex(data.index);
+          setTimeRemaining(data.timeLimitMs);
+          setShowLeaderboard(false);
+
+          // Désactiver l'animation après 500ms
+          setTimeout(() => setAnimateQuestion(false), 500);
+        });
+
+        // Question reveal (question_reveal from backend)
+        socket.on('question_reveal', (data: any) => {
+          console.log('[Overlay] question_reveal:', data);
+          setShowResults(true);
+          if (data.correctOptionIds && data.correctOptionIds.length > 0) {
+            setCorrectOptionId(data.correctOptionIds[0]);
           }
-        })
-        .catch(err => console.error('Failed to get session info:', err));
-    });
+          
+          // Afficher le leaderboard après 2 secondes
+          setTimeout(() => {
+            setShowLeaderboard(true);
+          }, 2000);
+        });
 
-    socket.on('disconnect', () => {
-      setConnected(false);
-    });
+        // Leaderboard update
+        socket.on('leaderboard_update', (data: any) => {
+          console.log('[Overlay] leaderboard_update:', data);
+          if (data.entries) {
+            setPlayers(data.entries.map((e: any) => ({ id: e.playerId, nickname: e.nickname, score: e.score })));
+          }
+          setShowLeaderboard(true);
+        });
 
-    // Session state update
-    socket.on('session_state', (data: any) => {
-      setPlayers(data.players || []);
-      setSessionStatus(data.status);
-      if (data.currentQuestion) {
-        setCurrentQuestion(data.currentQuestion);
-        setQuestionIndex(data.questionIndex || 0);
-        setTotalQuestions(data.totalQuestions || 0);
-      }
-    });
-
-    // Player joined
-    socket.on('player_joined', (data: any) => {
-      setPlayers(prev => {
-        if (prev.find(p => p.id === data.playerId)) return prev;
-        return [...prev, { id: data.playerId, nickname: data.nickname, score: 0 }];
+        // Game ended
+        socket.on('session_finished', (data: any) => {
+          console.log('[Overlay] session_finished:', data);
+          setSessionStatus('finished');
+          if (data.final) {
+            setPlayers(data.final.map((e: any) => ({ id: e.playerId, nickname: e.nickname, score: e.score })));
+          }
+          setShowLeaderboard(true);
+        });
+      })
+      .catch(err => {
+        console.error('[Overlay] Failed to get session info:', err);
       });
-    });
-
-    // Player left
-    socket.on('player_left', (data: any) => {
-      setPlayers(prev => prev.filter(p => p.id !== data.playerId));
-    });
-
-    // New question (question_started from backend)
-    socket.on('question_started', (data: any) => {
-      setShowResults(false);
-      setCorrectOptionId(null);
-      setLastAnswers([]);
-      setAnimateQuestion(true);
-      setSessionStatus('playing');
-      
-      setQuestionIndex(data.index);
-      setTimeRemaining(data.timeLimitMs);
-      setShowLeaderboard(false);
-
-      // Désactiver l'animation après 500ms
-      setTimeout(() => setAnimateQuestion(false), 500);
-    });
-
-    // Question reveal (question_reveal from backend)
-    socket.on('question_reveal', (data: any) => {
-      setShowResults(true);
-      if (data.correctOptionIds && data.correctOptionIds.length > 0) {
-        setCorrectOptionId(data.correctOptionIds[0]);
-      }
-      
-      // Afficher le leaderboard après 2 secondes
-      setTimeout(() => {
-        setShowLeaderboard(true);
-      }, 2000);
-    });
-
-    // Answer result (pour les animations)
-    socket.on('answer_ack', (data: any) => {
-      if (data.accepted) {
-        setLastAnswers(prev => [...prev, {
-          playerId: data.playerId || '',
-          nickname: data.nickname || 'Joueur',
-          correct: data.correct,
-          points: data.scoreDelta || 0,
-        }]);
-      }
-    });
-
-    // Leaderboard update
-    socket.on('leaderboard_update', (data: any) => {
-      if (data.entries) {
-        setPlayers(data.entries.map((e: any) => ({ id: e.playerId, nickname: e.nickname, score: e.score })));
-      }
-      setShowLeaderboard(true);
-    });
-
-    // Game started (from session_state status)
-    // Note: handled via session_state event
-
-    // Game ended
-    socket.on('session_finished', (data: any) => {
-      setSessionStatus('finished');
-      if (data.final) {
-        setPlayers(data.final.map((e: any) => ({ id: e.playerId, nickname: e.nickname, score: e.score })));
-      }
-      setShowLeaderboard(true);
-    });
 
     return () => {
-      socket.disconnect();
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
     };
   }, [code]);
 

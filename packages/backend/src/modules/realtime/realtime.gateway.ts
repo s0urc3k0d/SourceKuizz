@@ -972,12 +972,15 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
 
   private buildLeaderboardEntries(session: SessionState) {
     return Array.from(session.players.values())
+      .filter(p => p.id !== session.hostId) // Exclure l'hôte du leaderboard
       .sort((a, b) => b.score - a.score)
       .map((p, idx) => ({ playerId: p.id, nickname: p.nickname, score: p.score, rank: idx + 1 }));
   }
 
   private buildPlayersList(session: SessionState) {
-    return Array.from(session.players.entries()).map(([id, p]) => ({ id, nickname: p.nickname }));
+    return Array.from(session.players.entries())
+      .filter(([id]) => id !== session.hostId) // Exclure l'hôte de la liste des joueurs
+      .map(([id, p]) => ({ id, nickname: p.nickname }));
   }
 
   private buildSpectatorsList(session: SessionState) {
