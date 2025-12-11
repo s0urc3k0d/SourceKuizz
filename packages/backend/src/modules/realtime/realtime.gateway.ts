@@ -33,7 +33,10 @@ interface SessionQuestion {
   id: string;
   type: QuestionType;
   timeLimitMs: number;
-  options: { id: string; isCorrect: boolean; orderIndex?: number | null }[];
+  prompt: string;
+  mediaUrl?: string | null;
+  mediaType?: string | null;
+  options: { id: string; label: string; isCorrect: boolean; orderIndex?: number | null }[];
   // Pour text_input
   correctAnswers?: string[];
   caseSensitive?: boolean;
@@ -1064,7 +1067,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       const questions = await this.prisma.question.findMany({ 
         where: { quizId }, 
         orderBy: { order: 'asc' }, 
-        include: { options: { select: { id: true, isCorrect: true, orderIndex: true } } } 
+        include: { options: { select: { id: true, label: true, isCorrect: true, orderIndex: true } } } 
       });
       await this.createOrGetSession(c, quizId);
       // Lire flag persistant
@@ -1083,9 +1086,13 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         questions: questions.map((q: any) => ({
           id: q.id,
           type: (q.type || 'multiple_choice') as QuestionType,
+          prompt: q.prompt,
+          mediaUrl: q.mediaUrl,
+          mediaType: q.mediaType,
           timeLimitMs: q.timeLimitMs,
           options: q.options.map((o: any) => ({ 
-            id: o.id, 
+            id: o.id,
+            label: o.label,
             isCorrect: o.isCorrect,
             orderIndex: o.orderIndex ?? null 
           })),
