@@ -16,8 +16,8 @@ export default function AuthCallbackPage() {
     const handleAuth = async () => {
       const params = new URLSearchParams(window.location.search);
       const error = params.get('error');
-      const authSuccess = params.get('authSuccess');
-      const username = params.get('username');
+      const accessToken = params.get('accessToken');
+      const refreshToken = params.get('refreshToken');
       const avatarUrl = params.get('avatarUrl');
 
       if (error) {
@@ -26,46 +26,16 @@ export default function AuthCallbackPage() {
         return;
       }
 
-      // Nouveau flux: tokens dans cookies httpOnly
-      if (authSuccess === 'true') {
-        try {
-          const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
-          const response = await fetch(`${backendUrl}/auth/me`, {
-            method: 'GET',
-            credentials: 'include', // Inclut les cookies httpOnly
-          });
-
-          if (response.ok) {
-            const data = await response.json();
-            if (data.accessToken) {
-              setTokens(data.accessToken, data.refreshToken);
-              if (avatarUrl) {
-                try { localStorage.setItem('avatarUrl', avatarUrl); } catch {}
-              }
-              const returnTo = localStorage.getItem('authReturnTo') || '/';
-              localStorage.removeItem('authReturnTo');
-              router.replace(returnTo);
-              return;
-            }
-          }
-        } catch (err) {
-          console.warn('Could not fetch tokens from httpOnly cookies:', err);
-        }
-      }
-
-      // Fallback: ancien flux avec tokens en URL (pour rétrocompatibilité)
-      const accessToken = params.get('accessToken');
-      const refreshToken = params.get('refreshToken');
-
       if (accessToken) {
         setTokens(accessToken, refreshToken || undefined);
+        if (avatarUrl) {
+          try { localStorage.setItem('avatarUrl', avatarUrl); } catch {}
+        }
         const returnTo = localStorage.getItem('authReturnTo') || '/';
         localStorage.removeItem('authReturnTo');
+        // Nettoyer l'URL pour ne pas exposer les tokens dans l'historique
+        window.history.replaceState({}, '', '/auth/callback');
         router.replace(returnTo);
-      } else if (authSuccess === 'true') {
-        // Les cookies n'ont pas pu être lus mais l'auth a réussi
-        // Rediriger vers login pour réessayer
-        router.replace('/login?error=cookie_error');
       } else {
         setErrorMessage('Token manquant');
         setStatus('error');

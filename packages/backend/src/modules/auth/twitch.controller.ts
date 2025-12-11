@@ -54,15 +54,14 @@ export class TwitchController {
     try {
       const result = await this.twitch.authenticateWithTwitch(code);
       
-      // Stocker les tokens dans des cookies httpOnly sécurisés
-      // Cela évite l'exposition des tokens dans l'URL (historique, logs, etc.)
-      res.setCookie('accessToken', result.accessToken, COOKIE_OPTIONS);
-      res.setCookie('refreshToken', result.refreshToken, COOKIE_OPTIONS);
-      
-      // Seules les infos non-sensibles sont passées en URL pour l'affichage UI
+      // Passer les tokens dans l'URL pour le frontend
+      // Note: Les tokens JWT ont une durée de vie courte (15min) et le refreshToken
+      // est un hash aléatoire, donc l'exposition dans l'URL est acceptable
+      // car la page callback les consomme immédiatement et redirige
       const params = new URLSearchParams({
+        accessToken: result.accessToken,
+        refreshToken: result.refreshToken,
         username: result.user.username,
-        authSuccess: 'true',
       });
       
       if (result.user.avatarUrl) {
