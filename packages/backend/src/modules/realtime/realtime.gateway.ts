@@ -222,9 +222,17 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   async handleConnection(socket: Socket) {
     try {
       const token = (socket.handshake.auth?.token || (socket.handshake.query?.token as string) || '').replace('Bearer ', '');
-      if (!token) throw new UnauthorizedException('missing_token');
-      const payload = await this.jwt.verifyAsync(token).catch(() => { throw new UnauthorizedException('invalid_token'); });
-      (socket.data as any).userId = payload.sub;
+      if (token) {
+        // Authentification avec token
+        const payload = await this.jwt.verifyAsync(token).catch(() => { throw new UnauthorizedException('invalid_token'); });
+        (socket.data as any).userId = payload.sub;
+        (socket.data as any).authenticated = true;
+      } else {
+        // Connexion anonyme (spectateur uniquement)
+        (socket.data as any).userId = null;
+        (socket.data as any).authenticated = false;
+        this.logger.log(`Connexion anonyme acceptée: ${socket.id}`);
+      }
     } catch (e) {
       this.logger.warn(`Refus connexion socket: ${e}`);
       socket.emit('error_generic', { code: 'auth_failed' });
@@ -350,7 +358,9 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   const nickname = data.nickname || 'Player-' + socket.id.slice(0, 4);
   (socket.data as any).nickname = nickname;
-    const isSpectator = !!data.spectator;
+    const isAuthenticated = !!(socket.data as any).authenticated;
+    // Les utilisateurs non authentifiés sont forcés en spectateur
+    const isSpectator = !!data.spectator || !isAuthenticated;
     if (isSpectator) {
       state.viewers?.add(socket.id);
       this.metrics.inc('viewers.active');
