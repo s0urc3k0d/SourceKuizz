@@ -13,7 +13,7 @@ import { DatabaseModule } from '../database/database.module';
     DatabaseModule,
     JwtModule.register({
       global: true,
-      signOptions: { expiresIn: '15m' },
+      signOptions: { expiresIn: '7d' },  // 7 jours au lieu de 15 minutes
       secret: process.env.JWT_PRIVATE_KEY || 'dev_secret',
     }),
   ],
