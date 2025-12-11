@@ -538,7 +538,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     session.questionIndex += 1;
     session.activeQuestionStartedAt = undefined;
     session.phase = 'lobby';
-  this.server.to(code).emit('session_state', { status: 'lobby', questionIndex: session.questionIndex, remainingMs: 0, totalQuestions: session.questions.length, autoNext: session.autoNext, hostId: session.hostId, players: this.buildPlayersList(session), spectators: this.buildSpectatorsList(session), allowSpectatorReactions: !!session.allowSpectatorReactions });
+    this.broadcastSessionState(code, session, 0);
     if (session.autoNext) {
       session.timer = this.clock.setTimeout(() => {
         if (session.phase === 'lobby') {

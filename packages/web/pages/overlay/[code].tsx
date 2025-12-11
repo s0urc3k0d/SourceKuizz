@@ -64,8 +64,8 @@ export default function OverlayPage() {
   useEffect(() => {
     if (!code) return;
 
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000';
-    const socket = io(apiUrl, {
+    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'http://localhost:3001';
+    const socket = io(wsUrl, {
       transports: ['websocket'],
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -76,8 +76,16 @@ export default function OverlayPage() {
 
     socket.on('connect', () => {
       setConnected(true);
-      // Rejoindre en tant que spectateur
-      socket.emit('spectate', { code });
+      // Rejoindre en tant que spectateur via join_session
+      // On doit d'abord récupérer le quizId depuis l'API
+      fetch(`${process.env.NEXT_PUBLIC_API_URL || ''}/api/sessions/${code}/info`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.quizId) {
+            socket.emit('join_session', { code, quizId: data.quizId, spectator: true });
+          }
+        })
+        .catch(err => console.error('Failed to get session info:', err));
     });
 
     socket.on('disconnect', () => {
@@ -108,24 +116,15 @@ export default function OverlayPage() {
       setPlayers(prev => prev.filter(p => p.id !== data.playerId));
     });
 
-    // New question
-    socket.on('question', (data: any) => {
+    // New question (question_started from backend)
+    socket.on('question_started', (data: any) => {
       setShowResults(false);
       setCorrectOptionId(null);
       setLastAnswers([]);
       setAnimateQuestion(true);
+      setSessionStatus('playing');
       
-      setCurrentQuestion({
-        id: data.questionId,
-        type: data.type || 'multiple_choice',
-        prompt: data.prompt,
-        options: data.options || [],
-        mediaUrl: data.mediaUrl,
-        mediaType: data.mediaType,
-        timeLimitMs: data.timeLimitMs,
-      });
-      setQuestionIndex(data.questionIndex);
-      setTotalQuestions(data.totalQuestions);
+      setQuestionIndex(data.index);
       setTimeRemaining(data.timeLimitMs);
       setShowLeaderboard(false);
 
@@ -133,25 +132,12 @@ export default function OverlayPage() {
       setTimeout(() => setAnimateQuestion(false), 500);
     });
 
-    // Timer update
-    socket.on('timer', (data: any) => {
-      setTimeRemaining(data.remainingMs);
-    });
-
-    // Answer result (pour les animations)
-    socket.on('answer_result', (data: any) => {
-      setLastAnswers(prev => [...prev, {
-        playerId: data.playerId,
-        nickname: data.nickname || 'Joueur',
-        correct: data.correct,
-        points: data.points || 0,
-      }]);
-    });
-
-    // Question ended - show correct answer
-    socket.on('question_ended', (data: any) => {
+    // Question reveal (question_reveal from backend)
+    socket.on('question_reveal', (data: any) => {
       setShowResults(true);
-      setCorrectOptionId(data.correctOptionId);
+      if (data.correctOptionIds && data.correctOptionIds.length > 0) {
+        setCorrectOptionId(data.correctOptionIds[0]);
+      }
       
       // Afficher le leaderboard après 2 secondes
       setTimeout(() => {
@@ -159,21 +145,35 @@ export default function OverlayPage() {
       }, 2000);
     });
 
+    // Answer result (pour les animations)
+    socket.on('answer_ack', (data: any) => {
+      if (data.accepted) {
+        setLastAnswers(prev => [...prev, {
+          playerId: data.playerId || '',
+          nickname: data.nickname || 'Joueur',
+          correct: data.correct,
+          points: data.scoreDelta || 0,
+        }]);
+      }
+    });
+
     // Leaderboard update
-    socket.on('leaderboard', (data: any) => {
-      setPlayers(data.leaderboard || []);
+    socket.on('leaderboard_update', (data: any) => {
+      if (data.entries) {
+        setPlayers(data.entries.map((e: any) => ({ id: e.playerId, nickname: e.nickname, score: e.score })));
+      }
       setShowLeaderboard(true);
     });
 
-    // Game started
-    socket.on('game_started', () => {
-      setSessionStatus('playing');
-    });
+    // Game started (from session_state status)
+    // Note: handled via session_state event
 
     // Game ended
-    socket.on('game_ended', (data: any) => {
+    socket.on('session_finished', (data: any) => {
       setSessionStatus('finished');
-      setPlayers(data.finalLeaderboard || []);
+      if (data.final) {
+        setPlayers(data.final.map((e: any) => ({ id: e.playerId, nickname: e.nickname, score: e.score })));
+      }
       setShowLeaderboard(true);
     });
 
