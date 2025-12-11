@@ -38,7 +38,7 @@ export type RefreshDto = z.infer<typeof refreshDtoSchema>;
 
 // Types pour session
 export const ensureSessionDtoSchema = z.object({
-  quizId: z.string().uuid(),
+  quizId: z.string().min(1),  // CUID format (not UUID)
   code: z.string().regex(/^[A-Z0-9]{6}$/).optional(),
 });
 
