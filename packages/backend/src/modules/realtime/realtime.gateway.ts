@@ -306,11 +306,11 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       socket.emit('session_code_assigned', { code });
     }
   if (!this.sessions.has(code!)) {
-      // Charger questions minimalistes (id, timeLimitMs, options avec corrections)
+      // Charger questions avec tous les détails nécessaires pour l'overlay
       const questions = await this.prisma.question.findMany({
         where: { quizId },
         orderBy: { order: 'asc' },
-        include: { options: { select: { id: true, isCorrect: true } } },
+        include: { options: { select: { id: true, label: true, isCorrect: true, orderIndex: true } } },
       });
       // Créer ou récupérer la session DB de façon race-safe
       await this.createOrGetSession(code!, quizId);
@@ -331,9 +331,13 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         questions: questions.map((q: any) => ({
           id: q.id,
           type: (q.type || 'multiple_choice') as QuestionType,
+          prompt: q.prompt,
+          mediaUrl: q.mediaUrl,
+          mediaType: q.mediaType,
           timeLimitMs: q.timeLimitMs,
           options: q.options.map((o: any) => ({ 
-            id: o.id, 
+            id: o.id,
+            label: o.label,
             isCorrect: o.isCorrect,
             orderIndex: o.orderIndex ?? null 
           })),
@@ -710,7 +714,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.clearTimer(session);
     session.timer = this.clock.setTimeout(() => this.forceReveal(code), q.timeLimitMs || 5000);
     this.metrics.inc('question.start');
-    this.server.to(code).emit('question_started', { questionId: q.id, index: session.questionIndex, timeLimitMs: q.timeLimitMs });
+    // Envoyer les détails complets de la question (sans isCorrect pour ne pas tricher)
+    this.server.to(code).emit('question_started', { 
+      questionId: q.id, 
+      index: session.questionIndex, 
+      totalQuestions: session.questions.length,
+      timeLimitMs: q.timeLimitMs,
+      prompt: q.prompt,
+      type: q.type,
+      mediaUrl: q.mediaUrl,
+      mediaType: q.mediaType,
+      options: q.options.map(o => ({ id: o.id, label: o.label })), // Sans isCorrect !
+    });
   }
 
   @SubscribeMessage('submit_answer')
