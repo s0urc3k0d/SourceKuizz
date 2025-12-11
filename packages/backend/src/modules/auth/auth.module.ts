@@ -13,8 +13,8 @@ import { DatabaseModule } from '../database/database.module';
     DatabaseModule,
     JwtModule.register({
       global: true,
-      signOptions: { expiresIn: '7d' },  // 7 jours au lieu de 15 minutes
-      secret: process.env.JWT_PRIVATE_KEY || 'dev_secret',
+      signOptions: { expiresIn: process.env.JWT_EXPIRES || '7d' },
+      secret: process.env.JWT_SECRET || 'dev_secret',
     }),
   ],
   controllers: [AuthController, TwitchController],

@@ -7,7 +7,7 @@ import { z } from 'zod';
 
 export const WSJoinSessionSchema = z.object({
   code: z.string().regex(/^[A-Z0-9]{6}$/).optional(),
-  quizId: z.string().uuid(),
+  quizId: z.string().min(1),  // CUID format (not UUID)
   nickname: z.string().min(1).max(32).optional(),
   spectator: z.boolean().optional(),
 });
